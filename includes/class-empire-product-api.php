@@ -17,6 +17,7 @@ class Empire_Product_API {
         add_action( 'admin_menu', [ __CLASS__, 'add_admin_page' ] );
         add_action( 'admin_post_empire_product_sync', [ __CLASS__, 'handle_sync' ] );
         add_action( 'wp_ajax_empire_sync_step', [ __CLASS__, 'ajax_sync_step' ] );
+        add_filter( 'rest_request_before_callbacks', [ __CLASS__, 'intercept_rest_request' ], 10, 3 );
         // add_filter('woocommerce_rest_product_object_query', [__CLASS__, 'log_rest_product_query'], 10, 2);
         add_filter('woocommerce_rest_pre_insert_product', [__CLASS__, 'log_rest_product_update'], 10, 3);
         add_filter('woocommerce_rest_pre_insert_product_object', [__CLASS__, 'log_rest_product_update'], 10, 3);
@@ -1125,7 +1126,7 @@ class Empire_Product_API {
             self::$ftp_conn = null;
         }
     }
-    public static function upload_from_ftp_path( $ftp_path, $type = 'image' ) {
+    public static function upload_from_ftp_path( $ftp_path, $type = 'image', $provided_filename = '' ) {
 
         if ( empty( $ftp_path ) ) {
             return 0;
@@ -1150,7 +1151,7 @@ class Empire_Product_API {
         require_once ABSPATH . 'wp-admin/includes/image.php';
 
         // Check if already uploaded
-        $filename = basename( $ftp_path );
+        $filename = !empty($provided_filename) ? $provided_filename : basename( $ftp_path );
         // Remove query strings if any (e.g. image.jpg?v=1)
         if ( strpos( $filename, '?' ) !== false ) {
             $filename = explode( '?', $filename )[0];
@@ -1895,7 +1896,49 @@ class Empire_Product_API {
     }
 
     /**
-     * Process incoming REST product payload media:
+     * Intercepts standard WooCommerce REST requests BEFORE they process images.
+     * WooCommerce processes images arrays in prepare_item_for_database BEFORE our object injection hook.
+     * This intercepts it before that, processes the images using our dedup system, and replaces 'src' with 'id'
+     * so WooCommerce's native image downloader is totally bypassed.
+     */
+    public static function intercept_rest_request( $response, $handler, $request ) {
+        $route = $request->get_route();
+        
+        // Target /wc/v1, /wc/v2, /wc/v3 product endpoints for POST/PUT
+        if ( strpos( $route, '/wc/v' ) !== false && strpos( $route, '/products' ) !== false && in_array( $request->get_method(), [ 'POST', 'PUT' ] ) ) {
+            $images = $request->get_param('images');
+            if ( ! empty( $images ) && is_array( $images ) ) {
+                $modified_images = [];
+                foreach ( $images as $image ) {
+                    if ( empty( $image['id'] ) && ! empty( $image['src'] ) ) {
+                        self::log( "Empire Sync: Intercepting REST request to pre-upload image src: " . $image['src'] );
+                        
+                        // Check if payload provided a meaningful name to use as filename
+                        $name = $image['name'] ?? '';
+                        $provided_filename = '';
+                        if ( !empty($name) && strpos($name, 'picture') === false && strpos($name, 'image') === false ) {
+                            $provided_filename = $name;
+                        }
+
+                        $attach_id = self::upload_from_ftp_path( $image['src'], 'image', $provided_filename );
+                        if ( $attach_id ) {
+                            // Assign ID and remove src so WC doesn't download it
+                            $image['id'] = $attach_id;
+                            unset( $image['src'] );
+                        }
+                    }
+                    $modified_images[] = $image;
+                }
+                // Override the overall request params so WC engine uses our IDs
+                $request->set_param( 'images', $modified_images );
+            }
+        }
+        
+        return $response;
+    }
+
+    /**
+     * Filter called for WooCommerce REST API Product object payload injections.
      * - Download images/files
      * - Map by name (main vs secondary)
      * - Replace URLs in images + meta_data with attachment IDs
