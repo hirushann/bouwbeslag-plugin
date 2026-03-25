@@ -8,6 +8,7 @@ class Empire_Product_API {
 
     private static $instance = null;
     private static $upload_cache = [];
+    private static $rest_acf_assets = [];
     private static $api_url = 'https://empire.dayzsolutions.nl/products-api';
     private static $api_token = '1969a86944e633bbac66bb64761a15b17ef9e34cee7461968a6a8e30d0afadc5';
     private static $ftp_conn = null;
@@ -1131,10 +1132,14 @@ class Empire_Product_API {
         }
 
         $ftp_path = trim( $ftp_path );
+        $normalized_path = $ftp_path;
+        if ( strpos( $normalized_path, '?' ) !== false ) {
+            $normalized_path = explode( '?', $normalized_path )[0];
+        }
 
         // 0. Check internal request cache to prevent duplicate processing in a single execution loop
-        if ( isset( self::$upload_cache[$ftp_path] ) ) {
-            return self::$upload_cache[$ftp_path];
+        if ( isset( self::$upload_cache[$normalized_path] ) ) {
+            return self::$upload_cache[$normalized_path];
         }
 
         self::log( "Empire Sync: Checking image path: {$ftp_path} (Type: {$type})" );
@@ -1327,7 +1332,7 @@ class Empire_Product_API {
         }
 
         if ( $attachment_id ) {
-            self::$upload_cache[$ftp_path] = (int) $attachment_id;
+            self::$upload_cache[$normalized_path] = (int) $attachment_id;
             self::$upload_cache[$filename] = (int) $attachment_id;
         }
 
@@ -2184,22 +2189,28 @@ class Empire_Product_API {
             }
         }
 
-        // Synchronize back to the REST request so the default WooCommerce saver handles them
+        // We must store important info to be retrieved in the after-save hook
+        // Use SKU as key because product_id might be 0 for new products
+        $storage_key = !empty($sku) ? $sku : (string)$product_id;
+        self::$rest_acf_assets[$storage_key] = $acf_assets;
+
         $final_request_images = [];
         if ( $featured_id ) {
-            $final_request_images[] = [ 'id' => $featured_id ];
+            $final_request_images[] = [ 'id' => (int)$featured_id ];
         }
-        foreach ( array_unique($gallery_ids) as $gid ) {
+        $gallery_ids = array_unique($gallery_ids);
+        foreach ( $gallery_ids as $gid ) {
             if ( $gid != $featured_id ) {
-                $final_request_images[] = [ 'id' => $gid ];
+                $final_request_images[] = [ 'id' => (int)$gid ];
             }
         }
-        if ( ! empty( $final_request_images ) ) {
+        
+        // IMPORTANT: Always set the images param if we processed the payload, 
+        // even if empty, to prevent WooCommerce native sideloading from kicking in.
+        if ( $has_images ) {
             $request->set_param( 'images', $final_request_images );
+            self::log( "Empire Sync: Overriding REST images parameter with " . count($final_request_images) . " IDs for SKU: {$sku}" );
         }
-
-        // ACF sync is now handled in after_rest_product_save hook for reliability
-
 
         return $prepared_product;
     }
