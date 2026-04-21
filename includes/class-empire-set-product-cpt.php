@@ -144,9 +144,11 @@ class Empire_Set_Product_CPT {
         }
 
         // 2. Update ACF fields or standard meta
-        // E.g. payload: { "acf": { "set_price": "19.99", "items": "..." } }
         if ( isset( $params['acf'] ) && is_array( $params['acf'] ) ) {
-            foreach ( $params['acf'] as $key => $value ) {
+            // Recursively sanitize data (extract IDs from objects for ACF Post Objects/Taxonomies)
+            $sanitized_acf = self::sanitize_acf_data( $params['acf'] );
+
+            foreach ( $sanitized_acf as $key => $value ) {
                 // If it's an image field passed as a URL, we can use the existing helper to upload
                 if ( is_string( $value ) && filter_var( $value, FILTER_VALIDATE_URL ) && strpos( $key, 'image' ) !== false ) {
                     $attachment_id = Empire_Product_API::upload_from_ftp_path( $value, 'image' );
@@ -154,6 +156,7 @@ class Empire_Set_Product_CPT {
                         $value = $attachment_id;
                     }
                 }
+                
                 update_field( $key, $value, $id );
                 $updated_keys[] = $key;
             }
@@ -175,6 +178,31 @@ class Empire_Set_Product_CPT {
             'id'      => $id, 
             'updated_fields' => $updated_keys
         ], $is_creation ? 201 : 200 );
+    }
+
+    /**
+     * Recursively sanitize ACF data for Post Objects and Taxonomies
+     * Converts { "ID": 123, "title": "..." } -> 123
+     */
+    private static function sanitize_acf_data( $data ) {
+        if ( ! is_array( $data ) && ! is_object( $data ) ) {
+            return $data;
+        }
+
+        // If it's an object with an "ID" property (e.g. WP Post Object from your JSON)
+        if ( is_array( $data ) && isset( $data['ID'] ) ) {
+            return (int) $data['ID'];
+        }
+        if ( is_object( $data ) && isset( $data->ID ) ) {
+            return (int) $data->ID;
+        }
+
+        $sanitized = [];
+        foreach ( $data as $key => $value ) {
+            $sanitized[ $key ] = self::sanitize_acf_data( $value );
+        }
+
+        return $sanitized;
     }
 
     /**
