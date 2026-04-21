@@ -19,11 +19,8 @@ add_action( 'plugins_loaded', [ 'Empire_Category_API', 'init' ] );
 add_action( 'plugins_loaded', [ 'Empire_Set_Product_CPT', 'init' ] );
 
 add_filter('wp_headers', function($headers) {
-    // Whitelist your Next.js domain for CSP frame-ancestors
     $headers['Content-Security-Policy'] = "frame-ancestors 'self' https://bouwbeslag.nl;";
     
-    // Modern browsers use CSP, but older ones may need X-Frame-Options set to the specific URL
-    // Note: 'ALLOW-FROM' is deprecated but sometimes needed for legacy support
     unset($headers['X-Frame-Options']); 
     
     return $headers;
@@ -734,3 +731,195 @@ foreach ( array( 'term_description' ) as $filter ) {
 //     }
 // }
 // add_action( 'init', 'delete_all_media_programmatically' );
+
+
+/**
+ * Change customer processing order email subject
+ */
+//add_filter('woocommerce_email_subject_customer_processing_order', '', 10, 2);
+
+function change_customer_processing_order_email_subject($subject, $order) {
+
+    if ($order) {
+        $subject = 'Bouwbeslag order #' . $order->get_id() . ' bevestigd!';
+    }
+
+    return $subject;
+
+}
+
+
+/**
+ * DSO Display on mail template - Calculations
+ */
+
+define('DAYZ_CUTOFF_HOUR', 13);
+define('DAYZ_CUTOFF_MINUTE', 0);
+
+
+// HELPERS
+function dayz_get_holidays() {
+    $holidays = get_option('dayz-holidays', []);
+    return is_array($holidays) ? $holidays : [];
+}
+
+
+// BLOCKED DATES
+function dayz_is_blocked_delivery_date($timestamp) {
+    $date = date('Y-m-d', $timestamp);
+    $holidays = dayz_get_holidays();
+
+    if (in_array($date, $holidays)) return true;
+
+    $day = date('w', $timestamp);
+    return ($day == 0 || $day == 1); // Sun & Mon
+}
+
+function dayz_is_blocked_shipping_date($timestamp) {
+    $date = date('Y-m-d', $timestamp);
+    $holidays = dayz_get_holidays();
+
+    if (in_array($date, $holidays)) return true;
+
+    $day = date('w', $timestamp);
+    return ($day == 0 || $day == 6); // Sun & Sat
+}
+
+
+// CALCULATE DELIVERY DATE
+function dayz_calculate_delivery_date($lead_time_days = 1) {
+    $now = current_time('timestamp');
+    $shipping_date = $now;
+
+    $hour = (int) date('H', $now);
+    $minute = (int) date('i', $now);
+
+    $is_past_cutoff = (
+        $hour > DAYZ_CUTOFF_HOUR ||
+        ($hour == DAYZ_CUTOFF_HOUR && $minute >= DAYZ_CUTOFF_MINUTE)
+    );
+
+    if ($is_past_cutoff) {
+        $shipping_date = strtotime('+1 day', $shipping_date);
+    }
+
+    // Skip invalid shipping days
+    $safety = 0;
+    while (dayz_is_blocked_shipping_date($shipping_date) && $safety < 30) {
+        $shipping_date = strtotime('+1 day', $shipping_date);
+        $safety++;
+    }
+
+    // Delivery calculation
+    $delivery_date = $shipping_date;
+    $days_added = 0;
+
+    while ($days_added < $lead_time_days) {
+        $delivery_date = strtotime('+1 day', $delivery_date);
+
+        if (!dayz_is_blocked_delivery_date($delivery_date)) {
+            $days_added++;
+        }
+    }
+
+    return $delivery_date;
+}
+
+
+// MESSAGE 
+function dayz_format_delivery_message($timestamp) {
+
+    $today = strtotime('today', current_time('timestamp'));
+    $target = strtotime('today', $timestamp);
+
+    $diff = ceil(($target - $today) / 86400);
+
+    // Tomorrow → show BOTH
+    if ($diff == 1) {
+        return 'Geplande leverdatum: ' . date('d-m-Y', $timestamp);
+    }
+
+    // Default → full numeric date
+    return 'Geplande leverdatum: ' . date('d-m-Y', $timestamp);
+}
+
+
+// MAIN FUNCTION
+function dayz_get_delivery_info($stock_status, $qty, $stock = null, $lead_in = 1, $lead_out = 30) {
+
+    // IN STOCK
+    if (
+        ($stock !== null && $stock >= $qty) ||
+        ($stock === null && $stock_status === 'instock')
+    ) {
+        $date = dayz_calculate_delivery_date($lead_in);
+        $msg = dayz_format_delivery_message($date);
+
+        return [
+            'type' => 'IN_STOCK',
+            'message' => $msg,
+            'short' => $msg
+        ];
+    }
+
+    // PARTIAL STOCK
+    if ($stock !== null && $stock > 0 && $stock < $qty) {
+        $date1 = dayz_calculate_delivery_date($lead_in);
+        $date2 = dayz_calculate_delivery_date($lead_out);
+
+        return [
+            'type' => 'PARTIAL_STOCK',
+            'message' => 'Geplande leverdatum: ' . date_i18n('j F', $date1) . ' (gedeeltelijk), rest: ' . date_i18n('j F', $date2),
+            'short' => 'Deellevering'
+        ];
+    }
+
+    // BACKORDER
+    $date = dayz_calculate_delivery_date($lead_out);
+    $msg = dayz_format_delivery_message($date);
+
+    return [
+        'type' => 'BACKORDER',
+        'message' => $msg,
+        'short' => $msg
+    ];
+}
+
+/**
+ * Add woocommerce order items meta on email
+ */
+add_action('woocommerce_order_item_meta_end', function($item_id, $item, $order, $plain_text) {
+
+    // Only run for emails (not frontend/order page)
+    if (!did_action('woocommerce_email_order_details')) {
+        return;
+    }
+
+    $product = $item->get_product();
+
+    if (!$product) return;
+
+    // Get quantity from order item
+    $qty = $item->get_quantity();
+
+    // Get stock info
+    $stock_status = $product->get_stock_status();
+    $stock_qty    = $product->get_stock_quantity();
+
+    // Your delivery logic
+    $info = dayz_get_delivery_info(
+        $stock_status,
+        $qty,
+        $stock_qty
+    );
+
+    // Output
+    if ($plain_text) {
+        echo "\n" . $info['message'] . "\n";
+    } else {
+        echo '<p style="margin:4px 0 0;font-size:13px;color:#6b7280;">'
+            . esc_html($info['message']) .
+        '</p>';
+    }
+
+}, 10, 4);
