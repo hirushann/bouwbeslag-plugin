@@ -16,256 +16,165 @@ class Empire_Set_Product_CPT {
         add_action( 'init', [ __CLASS__, 'register_post_type' ] );
         add_action( 'rest_api_init', [ __CLASS__, 'register_rest_routes' ] );
         add_action( 'acf/save_post', [ __CLASS__, 'log_rest_api_format' ], 99 );
-        // Also fire on standard save_post just in case ACF isn't hooked yet
         add_action( 'save_post_set_product', [ __CLASS__, 'log_rest_api_format_fallback' ], 99, 3 );
     }
 
-    /**
-     * Register the Set Product Custom Post Type
-     */
     public static function register_post_type() {
         $labels = [
             'name'                  => _x( 'Set Products', 'Post type general name', 'empire-product-api' ),
             'singular_name'         => _x( 'Set Product', 'Post type singular name', 'empire-product-api' ),
             'menu_name'             => _x( 'Set Products', 'Admin Menu text', 'empire-product-api' ),
-            'name_admin_bar'        => _x( 'Set Product', 'Add New on Toolbar', 'empire-product-api' ),
-            'add_new'               => __( 'Add New', 'empire-product-api' ),
-            'add_new_item'          => __( 'Add New Set Product', 'empire-product-api' ),
-            'new_item'              => __( 'New Set Product', 'empire-product-api' ),
-            'edit_item'             => __( 'Edit Set Product', 'empire-product-api' ),
-            'view_item'             => __( 'View Set Product', 'empire-product-api' ),
-            'all_items'             => __( 'All Set Products', 'empire-product-api' ),
-            'search_items'          => __( 'Search Set Products', 'empire-product-api' ),
-            'parent_item_colon'     => __( 'Parent Set Products:', 'empire-product-api' ),
-            'not_found'             => __( 'No set products found.', 'empire-product-api' ),
-            'not_found_in_trash'    => __( 'No set products found in Trash.', 'empire-product-api' ),
-        ];
-
-        $args = [
-            'labels'             => $labels,
-            'public'             => true,
-            'publicly_queryable' => true,
-            'show_ui'            => true,
-            'show_in_menu'       => true,
-            'query_var'          => true,
-            'rewrite'            => [ 'slug' => 'set-product' ],
-            'capability_type'    => 'post',
-            'has_archive'        => true,
-            'hierarchical'       => false,
-            'menu_position'      => 56, // Under WooCommerce Products typically
-            'menu_icon'          => 'dashicons-products',
-            // Removed 'editor' to provide a clean area for ACF fields, making it look structured like a product
             'supports'           => [ 'title', 'thumbnail', 'excerpt', 'custom-fields' ],
-            'show_in_rest'       => false, // False forces the Classic Editor, which is typical for heavily ACF-driven product-like screens
+            'taxonomies'         => [ 'product_cat', 'product_tag' ],
+            'public'             => true,
+            'show_ui'            => true,
+            'menu_icon'          => 'dashicons-products',
+            'show_in_rest'       => false,
         ];
-
-        register_post_type( 'set_product', $args );
+        register_post_type( 'set_product', [ 'labels' => $labels, 'public' => true, 'supports' => $labels['supports'], 'taxonomies' => $labels['taxonomies'], 'show_in_rest' => false, 'menu_icon' => 'dashicons-products' ] );
     }
 
-    /**
-     * Register Custom REST API routes for updating Set Products
-     */
     public static function register_rest_routes() {
         register_rest_route( 'custom/v1', '/set-products(?:/(?P<slug>[a-zA-Z0-9_\-]+))?', array(
             'methods' => 'POST',
             'callback' => [ __CLASS__, 'update_set_product_webhook' ],
-            'permission_callback' => 'woocommerce_basic_permissions' // Using the existing WC REST auth check from main plugin
+            'permission_callback' => 'woocommerce_basic_permissions'
         ));
     }
 
-    /**
-     * Webhook callback to update or create the set product data
-     */
     public static function update_set_product_webhook( $request ) {
         $slug = $request->get_param( 'slug' );
         $params = $request->get_json_params();
+        $logger = function_exists( 'wc_get_logger' ) ? wc_get_logger() : null;
+
+        // Known keys from diagnostic logs
+        $key_map = [
+            'crucial_data'                => 'field_69e70bc0870c0',
+            'supplier_stock'              => 'field_69e70bd6870c1',
+            'categories'                  => 'field_69e70c1aa9fcc',
+            'delivery_if_stock'           => 'field_69e70d163b593',
+            'delivery_if_no_stock'        => 'field_69e70d243b594',
+            'delivery_if_low_but_1_stock' => 'field_69e70d2c3b595',
+            'product_set'                 => 'field_69e70e553b596'
+        ];
         
         $id = 0;
         if ( ! empty( $slug ) ) {
-            // Find existing Set Product by custom field 'slug'
-            $existing_posts = get_posts([
-                'post_type'      => 'set_product',
-                'meta_key'       => 'slug',
-                'meta_value'     => $slug,
-                'posts_per_page' => 1,
-                'post_status'    => 'any',
-                'fields'         => 'ids' // Only fetch ID for efficiency
-            ]);
-            if ( ! empty( $existing_posts ) ) {
-                $id = $existing_posts[0];
+            if ( is_numeric( $slug ) ) {
+                $check_post = get_post( intval( $slug ) );
+                if ( $check_post && $check_post->post_type === 'set_product' ) $id = $check_post->ID;
+            }
+            if ( ! $id ) {
+                $existing = get_posts([ 'post_type' => 'set_product', 'meta_key' => 'slug', 'meta_value' => $slug, 'posts_per_page' => 1, 'post_status' => 'any', 'fields' => 'ids' ]);
+                if ( ! empty( $existing ) ) $id = $existing[0];
             }
         }
 
         $is_creation = empty( $id );
-
         $post_args = [];
-        if ( isset( $params['name'] ) || isset( $params['title'] ) ) {
-            $post_args['post_title'] = sanitize_text_field( $params['name'] ?? $params['title'] );
-        }
-        if ( isset( $params['status'] ) ) {
-            $post_args['post_status'] = sanitize_text_field( $params['status'] );
-        }
+        if ( isset( $params['name'] ) ) $post_args['post_title'] = sanitize_text_field( $params['name'] );
+        if ( isset( $params['status'] ) ) $post_args['post_status'] = sanitize_text_field( $params['status'] );
 
         if ( $is_creation ) {
-            // Creation Mode
             $post_args['post_type'] = 'set_product';
-            if ( empty( $post_args['post_title'] ) ) {
-                $post_args['post_title'] = ! empty( $slug ) ? 'Set Product ' . $slug : 'New Set Product API';
-            }
-            if ( empty( $post_args['post_status'] ) ) {
-                $post_args['post_status'] = 'publish';
-            }
-
+            if ( empty( $post_args['post_title'] ) ) $post_args['post_title'] = $slug ?: 'New Set Product';
             $id = wp_insert_post( $post_args );
-            if ( is_wp_error( $id ) || $id === 0 ) {
-                return new WP_Error( 'create_failed', 'Failed to create Set Product', [ 'status' => 500 ] );
-            }
-            
-            // Save the slug as a custom field so we can look it up next time
-            if ( ! empty( $slug ) ) {
-                update_post_meta( $id, 'slug', sanitize_text_field( $slug ) );
-            }
+            if ( ! empty( $slug ) ) update_post_meta( $id, 'slug', $slug );
         } else {
-            // Update Mode
-            $post = get_post( $id );
-            if ( ! $post || $post->post_type !== 'set_product' ) {
-                return new WP_Error( 'not_found', 'Set Product not found', [ 'status' => 404 ] );
-            }
-
             $post_args['ID'] = $id;
-            if ( count( $post_args ) > 1 ) {
-                wp_update_post( $post_args );
-            }
-            
-            // Re-save the slug meta just to be safe
-            if ( ! empty( $slug ) ) {
-                update_post_meta( $id, 'slug', sanitize_text_field( $slug ) );
-            }
+            wp_update_post( $post_args );
         }
 
-        // 2. Update ACF fields or standard meta
         if ( isset( $params['acf'] ) && is_array( $params['acf'] ) ) {
-            // Recursively sanitize data (extract IDs from objects for ACF Post Objects/Taxonomies)
-            $sanitized_acf = self::sanitize_acf_data( $params['acf'] );
+            $acf_data = self::sanitize_acf_data( $params['acf'] );
 
-            foreach ( $sanitized_acf as $key => $value ) {
-                // If it's an image field passed as a URL, we can use the existing helper to upload
-                if ( is_string( $value ) && filter_var( $value, FILTER_VALIDATE_URL ) && strpos( $key, 'image' ) !== false ) {
-                    $attachment_id = Empire_Product_API::upload_from_ftp_path( $value, 'image' );
-                    if ( $attachment_id ) {
-                        $value = $attachment_id;
+            foreach ( $acf_data as $key => $value ) {
+                $field_key = $key_map[$key] ?? self::resolve_field_key($key);
+                
+                // Handle the Group 'crucial_data'
+                if ( $key === 'crucial_data' && is_array( $value ) ) {
+                    foreach ( $value as $sub_key => $sub_value ) {
+                        $sub_field_key = $key_map[$sub_key] ?? self::resolve_field_key($sub_key);
+                        
+                        // Handle Repeater 'product_set'
+                        if ( $sub_key === 'product_set' && is_array( $sub_value ) ) {
+                            $final_rows = [];
+                            foreach ( $sub_value as $index => $row ) {
+                                $clean_row = [];
+                                foreach ( $row as $rk => $rv ) {
+                                    $rk_key = self::resolve_field_key($rk);
+                                    $r_val = ( $rk === 'product' || $rk === 'quantity' ) ? (int)$rv : $rv;
+                                    $clean_row[$rk_key] = $r_val;
+                                    update_post_meta( $id, "crucial_data_product_set_{$index}_{$rk}", $r_val );
+                                    update_post_meta( $id, "_crucial_data_product_set_{$index}_{$rk}", $rk_key );
+                                }
+                                $final_rows[] = $clean_row;
+                            }
+                            $sub_value = $final_rows;
+                            update_post_meta( $id, 'crucial_data_product_set', count($sub_value) );
+                            update_post_meta( $id, '_crucial_data_product_set', $sub_field_key );
+                        }
+
+                        update_field( $sub_field_key, $sub_value, $id );
+                        update_post_meta( $id, "crucial_data_{$sub_key}", $sub_value );
+                        update_post_meta( $id, "_crucial_data_{$sub_key}", $sub_field_key );
+                        
+                        if ( $sub_key === 'categories' && is_array( $sub_value ) ) {
+                            wp_set_object_terms( $id, array_map('intval', $sub_value), 'product_cat' );
+                        }
                     }
                 }
-                
-                update_field( $key, $value, $id );
-                $updated_keys[] = $key;
+
+                update_field( $field_key, $value, $id );
             }
         }
 
-        // Catch-all for standard meta data (similar to WooCommerce REST API format)
-        if ( isset( $params['meta_data'] ) && is_array( $params['meta_data'] ) ) {
-            foreach ( $params['meta_data'] as $meta ) {
-                if ( isset( $meta['key'], $meta['value'] ) ) {
-                    update_post_meta( $id, sanitize_text_field( $meta['key'] ), $meta['value'] );
-                    $updated_keys[] = $meta['key'];
-                }
-            }
-        }
-
-        return new WP_REST_Response( [
-            'status'  => 'success',
-            'message' => $is_creation ? 'Set Product created successfully' : 'Set Product updated',
-            'id'      => $id, 
-            'updated_fields' => $updated_keys
-        ], $is_creation ? 201 : 200 );
+        return new WP_REST_Response( [ 'status' => 'success', 'id' => $id ], $is_creation ? 201 : 200 );
     }
 
-    /**
-     * Recursively sanitize ACF data for Post Objects and Taxonomies
-     * Converts { "ID": 123, "title": "..." } -> 123
-     */
+    private static function dump_fields_recursive($fields, $level = 0) {
+        $output = "";
+        foreach ($fields as $f) {
+            $indent = str_repeat("  ", $level);
+            $output .= "\n$indent- " . $f['name'] . " (" . $f['key'] . ") [" . $f['type'] . "]";
+            if (isset($f['sub_fields']) && !empty($f['sub_fields'])) {
+                $output .= self::dump_fields_recursive($f['sub_fields'], $level + 1);
+            }
+        }
+        return $output;
+    }
+
     private static function sanitize_acf_data( $data ) {
-        if ( ! is_array( $data ) && ! is_object( $data ) ) {
-            return $data;
-        }
-
-        // If it's an object with an "ID" property (e.g. WP Post Object from your JSON)
-        if ( is_array( $data ) && isset( $data['ID'] ) ) {
-            return (int) $data['ID'];
-        }
-        if ( is_object( $data ) && isset( $data->ID ) ) {
-            return (int) $data->ID;
-        }
-
+        if ( ! is_array( $data ) && ! is_object( $data ) ) return $data;
+        if ( is_array( $data ) && isset( $data['ID'] ) ) return (int) $data['ID'];
         $sanitized = [];
-        foreach ( $data as $key => $value ) {
-            $sanitized[ $key ] = self::sanitize_acf_data( $value );
-        }
-
+        foreach ( $data as $k => $v ) $sanitized[$k] = self::sanitize_acf_data($v);
         return $sanitized;
     }
 
-    /**
-     * Log REST API format when ACF saves the post
-     */
+    private static function resolve_field_key( $name ) {
+        if ( ! function_exists( 'acf_get_field' ) ) return $name;
+        $field = acf_get_field( $name );
+        return ( $field && isset( $field['key'] ) ) ? $field['key'] : $name;
+    }
+
     public static function log_rest_api_format( $post_id ) {
-        if ( get_post_type( $post_id ) !== 'set_product' ) {
-            return;
-        }
-        self::generate_and_log_format( $post_id );
+        if ( get_post_type( $post_id ) === 'set_product' ) self::generate_and_log_format( $post_id );
     }
 
-    /**
-     * Fallback log for non-ACF saves
-     */
     public static function log_rest_api_format_fallback( $post_id, $post, $update ) {
-        if ( defined( 'DOING_AUTOSAVE' ) && DOING_AUTOSAVE ) {
-            return;
-        }
-        // Avoid double-logging if ACF is active because ACF will fire the other hook
-        if ( isset( $_POST['acf'] ) ) {
-            return; 
-        }
-        self::generate_and_log_format( $post_id );
+        if ( !defined( 'DOING_AUTOSAVE' ) && get_post_type($post_id) === 'set_product' && !isset($_POST['acf']) ) self::generate_and_log_format( $post_id );
     }
 
-    /**
-     * Helper to generate the JSON and push it to debug.log
-     */
     private static function generate_and_log_format( $post_id ) {
         $post = get_post( $post_id );
-        
-        $acf_data = new stdClass();
-        if ( function_exists( 'get_fields' ) ) {
-            $fields = get_fields( $post_id );
-            if ( $fields ) {
-                $acf_data = $fields;
-            }
-        }
-
-        $payload = [
-            'name'   => $post->post_title,
-            'status' => $post->post_status,
-            'acf'    => $acf_data
-        ];
-
+        $payload = [ 'name' => $post->post_title, 'status' => $post->post_status, 'acf' => function_exists('get_fields') ? get_fields($post_id) : [] ];
         if ( function_exists( 'wc_get_logger' ) ) {
             $logger = wc_get_logger();
-            $slug_meta = get_post_meta( $post_id, 'slug', true );
-            $identifier = ! empty( $slug_meta ) ? $slug_meta : $post_id;
-
-            $log_message  = "=======================================================\n";
-            $log_message .= "🚀 SET PRODUCT REST API PAYLOAD GENERATOR 🚀\n";
-            $log_message .= "URL:    /wp-json/custom/v1/set-products/" . $identifier . "\n";
-            $log_message .= "METHOD: POST\n";
-            $log_message .= "HEADER: Authorization: Basic [base64 consumer_key:consumer_secret]\n";
-            $log_message .= "PAYLOAD JSON:\n";
-            $log_message .= wp_json_encode( $payload, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE ) . "\n";
-            $log_message .= "=======================================================\n";
-            
-            $logger->debug( $log_message, [ 'source' => 'set-product-rest-api' ] );
-        } else {
-            error_log( 'SET PRODUCT API PAYLOAD: ' . wp_json_encode( $payload ) );
+            $slug = get_post_meta( $post_id, 'slug', true ) ?: $post_id;
+            $log  = "URL: /wp-json/custom/v1/set-products/$slug\nPAYLOAD:\n" . wp_json_encode($payload, JSON_PRETTY_PRINT);
+            $logger->debug( $log, [ 'source' => 'set-product-rest-api' ] );
         }
     }
 }
+?>
