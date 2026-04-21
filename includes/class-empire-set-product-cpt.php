@@ -66,7 +66,7 @@ class Empire_Set_Product_CPT {
      * Register Custom REST API routes for updating Set Products
      */
     public static function register_rest_routes() {
-        register_rest_route( 'custom/v1', '/set-products(?:/(?P<id>\d+))?', array(
+        register_rest_route( 'custom/v1', '/set-products(?:/(?P<slug>[a-zA-Z0-9_\-]+))?', array(
             'methods' => 'POST',
             'callback' => [ __CLASS__, 'update_set_product_webhook' ],
             'permission_callback' => 'woocommerce_basic_permissions' // Using the existing WC REST auth check from main plugin
@@ -77,8 +77,25 @@ class Empire_Set_Product_CPT {
      * Webhook callback to update or create the set product data
      */
     public static function update_set_product_webhook( $request ) {
-        $id = $request->get_param( 'id' );
+        $slug = $request->get_param( 'slug' );
         $params = $request->get_json_params();
+        
+        $id = 0;
+        if ( ! empty( $slug ) ) {
+            // Find existing Set Product by custom field 'slug'
+            $existing_posts = get_posts([
+                'post_type'      => 'set_product',
+                'meta_key'       => 'slug',
+                'meta_value'     => $slug,
+                'posts_per_page' => 1,
+                'post_status'    => 'any',
+                'fields'         => 'ids' // Only fetch ID for efficiency
+            ]);
+            if ( ! empty( $existing_posts ) ) {
+                $id = $existing_posts[0];
+            }
+        }
+
         $is_creation = empty( $id );
 
         $post_args = [];
@@ -93,7 +110,7 @@ class Empire_Set_Product_CPT {
             // Creation Mode
             $post_args['post_type'] = 'set_product';
             if ( empty( $post_args['post_title'] ) ) {
-                $post_args['post_title'] = 'New Set Product API';
+                $post_args['post_title'] = ! empty( $slug ) ? 'Set Product ' . $slug : 'New Set Product API';
             }
             if ( empty( $post_args['post_status'] ) ) {
                 $post_args['post_status'] = 'publish';
@@ -102,6 +119,11 @@ class Empire_Set_Product_CPT {
             $id = wp_insert_post( $post_args );
             if ( is_wp_error( $id ) || $id === 0 ) {
                 return new WP_Error( 'create_failed', 'Failed to create Set Product', [ 'status' => 500 ] );
+            }
+            
+            // Save the slug as a custom field so we can look it up next time
+            if ( ! empty( $slug ) ) {
+                update_post_meta( $id, 'slug', sanitize_text_field( $slug ) );
             }
         } else {
             // Update Mode
@@ -113,6 +135,11 @@ class Empire_Set_Product_CPT {
             $post_args['ID'] = $id;
             if ( count( $post_args ) > 1 ) {
                 wp_update_post( $post_args );
+            }
+            
+            // Re-save the slug meta just to be safe
+            if ( ! empty( $slug ) ) {
+                update_post_meta( $id, 'slug', sanitize_text_field( $slug ) );
             }
         }
 
@@ -196,9 +223,12 @@ class Empire_Set_Product_CPT {
 
         if ( function_exists( 'wc_get_logger' ) ) {
             $logger = wc_get_logger();
+            $slug_meta = get_post_meta( $post_id, 'slug', true );
+            $identifier = ! empty( $slug_meta ) ? $slug_meta : $post_id;
+
             $log_message  = "=======================================================\n";
             $log_message .= "🚀 SET PRODUCT REST API PAYLOAD GENERATOR 🚀\n";
-            $log_message .= "URL:    /wp-json/custom/v1/set-products/" . $post_id . "\n";
+            $log_message .= "URL:    /wp-json/custom/v1/set-products/" . $identifier . "\n";
             $log_message .= "METHOD: POST\n";
             $log_message .= "HEADER: Authorization: Basic [base64 consumer_key:consumer_secret]\n";
             $log_message .= "PAYLOAD JSON:\n";
