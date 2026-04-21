@@ -12,9 +12,11 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 require_once plugin_dir_path( __FILE__ ) . 'includes/class-empire-product-api.php';
 require_once plugin_dir_path( __FILE__ ) . 'includes/class-empire-category-api.php';
+require_once plugin_dir_path( __FILE__ ) . 'includes/class-empire-set-product-cpt.php';
 
 add_action( 'plugins_loaded', [ 'Empire_Product_API', 'init' ] );
 add_action( 'plugins_loaded', [ 'Empire_Category_API', 'init' ] );
+add_action( 'plugins_loaded', [ 'Empire_Set_Product_CPT', 'init' ] );
 
 add_filter('wp_headers', function($headers) {
     // Whitelist your Next.js domain for CSP frame-ancestors
