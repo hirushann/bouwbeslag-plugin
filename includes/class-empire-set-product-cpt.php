@@ -47,16 +47,26 @@ class Empire_Set_Product_CPT {
         $params = $request->get_json_params();
         $logger = function_exists( 'wc_get_logger' ) ? wc_get_logger() : null;
 
-        // Known keys from diagnostic logs
+        // Known keys for Set Product CPT
         $key_map = [
             'crucial_data'                => 'field_69e70bc0870c0',
-            'supplier_stock'              => 'field_69e70bd6870c1',
-            'categories'                  => 'field_69e70c1aa9fcc',
-            'delivery_if_stock'           => 'field_69e70d163b593',
-            'delivery_if_no_stock'        => 'field_69e70d243b594',
-            'delivery_if_low_but_1_stock' => 'field_69e70d2c3b595',
             'product_set'                 => 'field_69e70e553b596'
         ];
+
+        if ( $logger ) {
+             $logger->debug( "Incoming Set Product request for slug: " . $slug, [ 'source' => 'set-product-webhook' ] );
+             
+             // DEBUG: Recursive Dumper to find hidden keys
+             if ( function_exists('acf_get_field_groups') ) {
+                 $groups = acf_get_field_groups(['post_type' => 'set_product']);
+                 $structure = "";
+                 foreach ( $groups as $g ) {
+                     $fields = acf_get_fields($g['key']);
+                     if ($fields) $structure .= self::dump_fields_recursive($fields);
+                 }
+                 $logger->debug( "ACF DEEP STRUCTURE:" . $structure, [ 'source' => 'set-product-webhook' ] );
+             }
+        }
         
         $id = 0;
         if ( ! empty( $slug ) ) {
@@ -91,22 +101,40 @@ class Empire_Set_Product_CPT {
             foreach ( $acf_data as $key => $value ) {
                 $field_key = $key_map[$key] ?? self::resolve_field_key($key);
                 
-                // Handle the Group 'crucial_data'
                 if ( $key === 'crucial_data' && is_array( $value ) ) {
                     foreach ( $value as $sub_key => $sub_value ) {
                         $sub_field_key = $key_map[$sub_key] ?? self::resolve_field_key($sub_key);
                         
-                        // Handle Repeater 'product_set'
                         if ( $sub_key === 'product_set' && is_array( $sub_value ) ) {
                             $final_rows = [];
                             foreach ( $sub_value as $index => $row ) {
+                                // --- Resolve Product ID by SKU or Bouwbeslag ID ---
+                                $found_product_id = 0;
+                                if ( isset($row['sku']) && !empty($row['sku']) ) {
+                                    $found_product_id = function_exists('wc_get_product_id_by_sku') ? wc_get_product_id_by_sku($row['sku']) : 0;
+                                }
+                                if ( !$found_product_id && isset($row['bouwbeslag_id']) && !empty($row['bouwbeslag_id']) ) {
+                                    $lookup = get_posts([ 'post_type' => 'product', 'meta_key' => 'bouwbeslag_id', 'meta_value' => $row['bouwbeslag_id'], 'fields' => 'ids', 'posts_per_page' => 1 ]);
+                                    if (!empty($lookup)) $found_product_id = $lookup[0];
+                                }
+                                if ( !$found_product_id && isset($row['product']) ) {
+                                    $found_product_id = (int)$row['product'];
+                                }
+
                                 $clean_row = [];
-                                foreach ( $row as $rk => $rv ) {
+                                // Ensure standard structure for ACF (name => value)
+                                $item_data = [
+                                    'product'  => $found_product_id,
+                                    'quantity' => isset($row['quantity']) ? (float)$row['quantity'] : 1
+                                ];
+
+                                foreach ( $item_data as $rk => $rv ) {
                                     $rk_key = self::resolve_field_key($rk);
-                                    $r_val = ( $rk === 'product' || $rk === 'quantity' ) ? (int)$rv : $rv;
-                                    $clean_row[$rk_key] = $r_val;
-                                    update_post_meta( $id, "crucial_data_product_set_{$index}_{$rk}", $r_val );
-                                    update_post_meta( $id, "_crucial_data_product_set_{$index}_{$rk}", $rk_key );
+                                    $clean_row[$rk_key] = $rv;
+                                    // Save raw meta AND the hidden ACF reference key for UI visibility
+                                    $meta_key = "crucial_data_product_set_{$index}_{$rk}";
+                                    update_post_meta( $id, $meta_key, $rv );
+                                    update_post_meta( $id, "_" . $meta_key, $rk_key );
                                 }
                                 $final_rows[] = $clean_row;
                             }
@@ -137,9 +165,7 @@ class Empire_Set_Product_CPT {
         foreach ($fields as $f) {
             $indent = str_repeat("  ", $level);
             $output .= "\n$indent- " . $f['name'] . " (" . $f['key'] . ") [" . $f['type'] . "]";
-            if (isset($f['sub_fields']) && !empty($f['sub_fields'])) {
-                $output .= self::dump_fields_recursive($f['sub_fields'], $level + 1);
-            }
+            if (isset($f['sub_fields']) && !empty($f['sub_fields'])) $output .= self::dump_fields_recursive($f['sub_fields'], $level + 1);
         }
         return $output;
     }
