@@ -47,27 +47,15 @@ class Empire_Set_Product_CPT {
         $params = $request->get_json_params();
         $logger = function_exists( 'wc_get_logger' ) ? wc_get_logger() : null;
 
-        // Known keys for Set Product CPT
-        $key_map = [
-            'crucial_data'                => 'field_69e70bc0870c0',
-            'product_set'                 => 'field_69e70e553b596'
-        ];
-
-        if ( $logger ) {
-             $logger->debug( "Incoming Set Product request for slug: " . $slug, [ 'source' => 'set-product-webhook' ] );
-             
-             // DEBUG: Recursive Dumper to find hidden keys
-             if ( function_exists('acf_get_field_groups') ) {
-                 $groups = acf_get_field_groups(['post_type' => 'set_product']);
-                 $structure = "";
-                 foreach ( $groups as $g ) {
-                     $fields = acf_get_fields($g['key']);
-                     if ($fields) $structure .= self::dump_fields_recursive($fields);
-                 }
-                 $logger->debug( "ACF DEEP STRUCTURE:" . $structure, [ 'source' => 'set-product-webhook' ] );
-             }
+        if ( empty( $params ) ) {
+            return new WP_Error( 'no_data', 'No data provided', [ 'status' => 400 ] );
         }
-        
+
+        // Use slug from payload if not in URL
+        if ( empty( $slug ) && ! empty( $params['slug'] ) ) {
+            $slug = $params['slug'];
+        }
+
         $id = 0;
         if ( ! empty( $slug ) ) {
             if ( is_numeric( $slug ) ) {
@@ -75,18 +63,53 @@ class Empire_Set_Product_CPT {
                 if ( $check_post && $check_post->post_type === 'set_product' ) $id = $check_post->ID;
             }
             if ( ! $id ) {
-                $existing = get_posts([ 'post_type' => 'set_product', 'meta_key' => 'slug', 'meta_value' => $slug, 'posts_per_page' => 1, 'post_status' => 'any', 'fields' => 'ids' ]);
+                $existing = get_posts([ 
+                    'post_type' => 'set_product', 
+                    'meta_key' => 'slug', 
+                    'meta_value' => $slug, 
+                    'posts_per_page' => 1, 
+                    'post_status' => 'any', 
+                    'fields' => 'ids' 
+                ]);
+                if ( ! empty( $existing ) ) $id = $existing[0];
+            }
+            if ( ! $id ) {
+                $existing = get_posts([
+                    'post_type' => 'set_product',
+                    'name' => sanitize_title($slug),
+                    'posts_per_page' => 1,
+                    'post_status' => 'any',
+                    'fields' => 'ids'
+                ]);
                 if ( ! empty( $existing ) ) $id = $existing[0];
             }
         }
 
+        // Try by SKU if still not found
+        if ( ! $id && ! empty( $params['sku'] ) ) {
+             $existing = get_posts([ 
+                'post_type' => 'set_product', 
+                'meta_key' => '_sku', 
+                'meta_value' => sanitize_text_field( $params['sku'] ), 
+                'posts_per_page' => 1, 
+                'post_status' => 'any', 
+                'fields' => 'ids' 
+            ]);
+            if ( ! empty( $existing ) ) $id = $existing[0];
+        }
+
         $is_creation = empty( $id );
-        $post_args = [];
+        $post_args = [
+            'post_type' => 'set_product',
+        ];
+
         if ( isset( $params['name'] ) ) $post_args['post_title'] = sanitize_text_field( $params['name'] );
         if ( isset( $params['status'] ) ) $post_args['post_status'] = sanitize_text_field( $params['status'] );
+        if ( isset( $params['description'] ) ) $post_args['post_content'] = wp_kses_post( $params['description'] );
+        if ( isset( $params['short_description'] ) ) $post_args['post_excerpt'] = wp_kses_post( $params['short_description'] );
+        if ( isset( $params['slug'] ) ) $post_args['post_name'] = sanitize_title( $params['slug'] );
 
         if ( $is_creation ) {
-            $post_args['post_type'] = 'set_product';
             if ( empty( $post_args['post_title'] ) ) $post_args['post_title'] = $slug ?: 'New Set Product';
             $id = wp_insert_post( $post_args );
             if ( ! empty( $slug ) ) update_post_meta( $id, 'slug', $slug );
@@ -95,65 +118,118 @@ class Empire_Set_Product_CPT {
             wp_update_post( $post_args );
         }
 
-        if ( isset( $params['acf'] ) && is_array( $params['acf'] ) ) {
-            $acf_data = self::sanitize_acf_data( $params['acf'] );
+        if ( $logger ) {
+             $logger->debug( "Processing Set Product ID: " . $id . " for slug: " . $slug, [ 'source' => 'set-product-webhook' ] );
+        }
 
-            foreach ( $acf_data as $key => $value ) {
-                $field_key = $key_map[$key] ?? self::resolve_field_key($key);
+        // Standard WooCommerce / Meta Fields
+        if ( isset( $params['sku'] ) ) update_post_meta( $id, '_sku', sanitize_text_field( $params['sku'] ) );
+        if ( isset( $params['regular_price'] ) ) {
+            update_post_meta( $id, '_regular_price', sanitize_text_field( $params['regular_price'] ) );
+            update_post_meta( $id, '_price', sanitize_text_field( $params['regular_price'] ) );
+        }
+        if ( isset( $params['manage_stock'] ) ) update_post_meta( $id, '_manage_stock', $params['manage_stock'] ? 'yes' : 'no' );
+        if ( isset( $params['stock_quantity'] ) ) update_post_meta( $id, '_stock', (int)$params['stock_quantity'] );
+        if ( isset( $params['stock_status'] ) ) update_post_meta( $id, '_stock_status', sanitize_text_field( $params['stock_status'] ) );
+        if ( isset( $params['catalog_visibility'] ) ) update_post_meta( $id, '_visibility', sanitize_text_field( $params['catalog_visibility'] ) );
+        if ( isset( $params['type'] ) ) update_post_meta( $id, '_product_type', sanitize_text_field( $params['type'] ) );
+
+        // Categories Handling: Convert to lowercase and match
+        if ( ! empty( $params['categories'] ) && is_array( $params['categories'] ) ) {
+            $category_ids = [];
+            foreach ( $params['categories'] as $cat ) {
+                $cat_name = isset( $cat['name'] ) ? $cat['name'] : '';
+                if ( empty( $cat_name ) ) continue;
+
+                $search_name = strtolower( trim( $cat_name ) );
                 
-                if ( $key === 'crucial_data' && is_array( $value ) ) {
-                    foreach ( $value as $sub_key => $sub_value ) {
-                        $sub_field_key = $key_map[$sub_key] ?? self::resolve_field_key($sub_key);
-                        
-                        if ( $sub_key === 'product_set' && is_array( $sub_value ) ) {
-                            $final_rows = [];
-                            foreach ( $sub_value as $index => $row ) {
-                                // --- Resolve Product ID by SKU or Bouwbeslag ID ---
-                                $found_product_id = 0;
-                                if ( isset($row['sku']) && !empty($row['sku']) ) {
-                                    $found_product_id = function_exists('wc_get_product_id_by_sku') ? wc_get_product_id_by_sku($row['sku']) : 0;
-                                }
-                                if ( !$found_product_id && isset($row['bouwbeslag_id']) && !empty($row['bouwbeslag_id']) ) {
-                                    $lookup = get_posts([ 'post_type' => 'product', 'meta_key' => 'bouwbeslag_id', 'meta_value' => $row['bouwbeslag_id'], 'fields' => 'ids', 'posts_per_page' => 1 ]);
-                                    if (!empty($lookup)) $found_product_id = $lookup[0];
-                                }
-                                if ( !$found_product_id && isset($row['product']) ) {
-                                    $found_product_id = (int)$row['product'];
-                                }
+                // Try matching by name directly (usually case-insensitive in WP)
+                $term = get_term_by( 'name', $cat_name, 'product_cat' );
+                
+                if ( ! $term ) {
+                    // Try matching by slug (which is lowercase)
+                    $term = get_term_by( 'slug', sanitize_title( $search_name ), 'product_cat' );
+                }
 
-                                $clean_row = [];
-                                // Ensure standard structure for ACF (name => value)
-                                $item_data = [
-                                    'product'  => $found_product_id,
-                                    'quantity' => isset($row['quantity']) ? (float)$row['quantity'] : 1
-                                ];
-
-                                foreach ( $item_data as $rk => $rv ) {
-                                    $rk_key = self::resolve_field_key($rk);
-                                    $clean_row[$rk_key] = $rv;
-                                    // Save raw meta AND the hidden ACF reference key for UI visibility
-                                    $meta_key = "crucial_data_product_set_{$index}_{$rk}";
-                                    update_post_meta( $id, $meta_key, $rv );
-                                    update_post_meta( $id, "_" . $meta_key, $rk_key );
-                                }
-                                $final_rows[] = $clean_row;
+                if ( ! $term ) {
+                    // Manual search in case term name matching is strict
+                    $all_cats = get_terms( [ 'taxonomy' => 'product_cat', 'hide_empty' => false ] );
+                    if ( ! is_wp_error( $all_cats ) ) {
+                        foreach ( $all_cats as $c ) {
+                            if ( strtolower( trim( $c->name ) ) === $search_name || $c->slug === sanitize_title( $search_name ) ) {
+                                $term = $c;
+                                break;
                             }
-                            $sub_value = $final_rows;
-                            update_post_meta( $id, 'crucial_data_product_set', count($sub_value) );
-                            update_post_meta( $id, '_crucial_data_product_set', $sub_field_key );
-                        }
-
-                        update_field( $sub_field_key, $sub_value, $id );
-                        update_post_meta( $id, "crucial_data_{$sub_key}", $sub_value );
-                        update_post_meta( $id, "_crucial_data_{$sub_key}", $sub_field_key );
-                        
-                        if ( $sub_key === 'categories' && is_array( $sub_value ) ) {
-                            wp_set_object_terms( $id, array_map('intval', $sub_value), 'product_cat' );
                         }
                     }
                 }
 
-                update_field( $field_key, $value, $id );
+                if ( $term ) {
+                    $category_ids[] = (int) $term->term_id;
+                }
+            }
+            if ( ! empty( $category_ids ) ) {
+                wp_set_object_terms( $id, array_unique( $category_ids ), 'product_cat' );
+            }
+        }
+
+        // Product Set (ACF Repeater) Handling
+        $product_set_data = null;
+        if ( isset( $params['product_set'] ) && is_array( $params['product_set'] ) ) {
+            $product_set_data = $params['product_set'];
+        } elseif ( isset( $params['acf']['crucial_data']['product_set'] ) ) {
+            $product_set_data = $params['acf']['crucial_data']['product_set'];
+        } elseif ( isset( $params['acf']['product_set'] ) ) {
+            $product_set_data = $params['acf']['product_set'];
+        }
+
+        if ( is_array( $product_set_data ) ) {
+            $repeater_rows = [];
+            foreach ( $product_set_data as $index => $row ) {
+                $found_product_id = 0;
+                if ( ! empty( $row['sku'] ) ) {
+                    $found_product_id = function_exists( 'wc_get_product_id_by_sku' ) ? wc_get_product_id_by_sku( $row['sku'] ) : 0;
+                }
+                if ( ! $found_product_id && ! empty( $row['bouwbeslag_id'] ) ) {
+                    $lookup = get_posts([ 
+                        'post_type' => 'product', 
+                        'meta_key' => 'bouwbeslag_id', 
+                        'meta_value' => $row['bouwbeslag_id'], 
+                        'fields' => 'ids', 
+                        'posts_per_page' => 1 
+                    ]);
+                    if ( ! empty( $lookup ) ) $found_product_id = $lookup[0];
+                }
+                if ( ! $found_product_id && ! empty( $row['product'] ) ) {
+                    $found_product_id = (int) $row['product'];
+                }
+
+                $qty = isset( $row['quantity'] ) ? (float) $row['quantity'] : 1;
+
+                // ACF format for update_field with keys
+                $repeater_rows[] = [
+                    'field_69e70e683b597' => $found_product_id, // product subfield
+                    'field_69e70e783b598' => $qty                // quantity subfield
+                ];
+
+                // Legacy Meta format for UI visibility
+                $meta_prefix = "crucial_data_product_set_{$index}_";
+                update_post_meta( $id, $meta_prefix . "product", $found_product_id );
+                update_post_meta( $id, "_" . $meta_prefix . "product", 'field_69e70e683b597' );
+                update_post_meta( $id, $meta_prefix . "quantity", $qty );
+                update_post_meta( $id, "_" . $meta_prefix . "quantity", 'field_69e70e783b598' );
+            }
+            
+            update_field( 'field_69e70e553b596', $repeater_rows, $id ); // product_set repeater key
+            update_post_meta( $id, 'crucial_data_product_set', count( $repeater_rows ) );
+            update_post_meta( $id, '_crucial_data_product_set', 'field_69e70e553b596' );
+        }
+
+        // Generic ACF fallback for other fields
+        if ( isset( $params['acf'] ) && is_array( $params['acf'] ) ) {
+            foreach ( $params['acf'] as $key => $value ) {
+                if ( in_array( $key, [ 'crucial_data', 'product_set' ] ) ) continue;
+                update_field( $key, $value, $id );
             }
         }
 
