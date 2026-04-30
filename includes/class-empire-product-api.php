@@ -1494,13 +1494,13 @@ class Empire_Product_API {
             return false;
         }
 
-        $product = wc_get_product( $product_id );
-        if ( ! $product ) {
-            return false;
+        // Start by reading whatever is already saved for this product.
+        $existing_meta = get_post_meta( $product_id, '_product_attributes', true );
+        if ( ! is_array( $existing_meta ) ) {
+            $existing_meta = [];
         }
 
-        $product_attributes_meta = [];
-        $wc_attributes = [];
+        $added = false;
 
         foreach ( $attributes as $group ) {
             if ( ! is_array( $group ) ) {
@@ -1532,30 +1532,36 @@ class Empire_Product_API {
                 $attr_slug = sanitize_title( $key );
                 $taxonomy  = 'pa_' . $attr_slug;
 
-                // Ensure attribute taxonomy exists
+                // --- Ensure attribute taxonomy exists in WC and in WP ---
                 if ( ! taxonomy_exists( $taxonomy ) ) {
                     $attr_id = wc_create_attribute( [
-                        'name' => ucwords( str_replace( '_', ' ', $key ) ),
-                        'slug' => $attr_slug,
-                        'type' => 'select',
-                        'order_by' => 'menu_order',
+                        'name'         => ucwords( str_replace( '_', ' ', $key ) ),
+                        'slug'         => $attr_slug,
+                        'type'         => 'select',
+                        'order_by'     => 'menu_order',
                         'has_archives' => false,
                     ] );
 
+                    // Flush the WC attribute taxonomy cache so the new attribute
+                    // is visible to wp_insert_term() within the same PHP request.
+                    delete_transient( 'wc_attribute_taxonomies' );
+                    WC_Cache_Helper::invalidate_cache_group( 'woocommerce' );
+
+                    // Register the taxonomy in WordPress for this request.
                     register_taxonomy(
                         $taxonomy,
                         [ 'product' ],
                         [
                             'hierarchical' => false,
-                            'label' => ucwords( str_replace( '_', ' ', $key ) ),
-                            'show_ui' => true,
-                            'query_var' => true,
-                            'rewrite' => [ 'slug' => $attr_slug ],
+                            'label'        => ucwords( str_replace( '_', ' ', $key ) ),
+                            'show_ui'      => true,
+                            'query_var'    => true,
+                            'rewrite'      => [ 'slug' => $attr_slug ],
                         ]
                     );
                 }
 
-                // Create / collect terms
+                // --- Create / collect term IDs ---
                 $term_ids = [];
 
                 foreach ( $values as $value ) {
@@ -1569,6 +1575,7 @@ class Empire_Product_API {
                     }
 
                     if ( is_wp_error( $term ) ) {
+                        self::log( "Empire Sync: Failed to create term '{$value}' in '{$taxonomy}': " . $term->get_error_message() );
                         continue;
                     }
 
@@ -1579,11 +1586,15 @@ class Empire_Product_API {
                     continue;
                 }
 
-                // ✅ Assign terms to product
-                wp_set_object_terms( $product_id, $term_ids, $taxonomy, false );
+                // Assign terms to the product post
+                $result = wp_set_object_terms( $product_id, $term_ids, $taxonomy, false );
+                if ( is_wp_error( $result ) ) {
+                    self::log( "Empire Sync: wp_set_object_terms failed for '{$taxonomy}': " . $result->get_error_message() );
+                    continue;
+                }
 
-                // ✅ Save attribute meta config
-                $product_attributes_meta[ $taxonomy ] = [
+                // Merge into the existing _product_attributes meta (never overwrite other attributes)
+                $existing_meta[ $taxonomy ] = [
                     'name'         => $taxonomy,
                     'value'        => '',
                     'position'     => 0,
@@ -1591,15 +1602,17 @@ class Empire_Product_API {
                     'is_variation' => 0,
                     'is_taxonomy'  => 1,
                 ];
+
+                $added = true;
             }
         }
 
-        if ( empty( $product_attributes_meta ) ) {
+        if ( ! $added ) {
             return false;
         }
 
-        // Persist attribute config
-        update_post_meta( $product_id, '_product_attributes', $product_attributes_meta );
+        // Write merged attribute meta back to DB
+        update_post_meta( $product_id, '_product_attributes', $existing_meta );
 
         // Clear caches
         clean_object_term_cache( $product_id, 'product' );
@@ -1609,6 +1622,7 @@ class Empire_Product_API {
     }
 
     /**
+
      * Update product related fields (order_color, order_model, matching_* fields) from API.
      * Updates each related field individually using update_field().
      */
