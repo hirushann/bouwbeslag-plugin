@@ -1595,16 +1595,6 @@ class Empire_Product_API {
                     'is_variation' => 0,
                     'is_taxonomy'  => 1,
                 ];
-
-                // ✅ THIS IS THE CRITICAL FIX
-                $wc_attr = new WC_Product_Attribute();
-                $wc_attr->set_id( wc_attribute_taxonomy_id_by_name( $taxonomy ) );
-                $wc_attr->set_name( $taxonomy );
-                $wc_attr->set_options( $term_ids ); // 🔥 REQUIRED
-                $wc_attr->set_visible( true );
-                $wc_attr->set_variation( false );
-
-                $wc_attributes[] = $wc_attr;
             }
         }
 
@@ -1614,10 +1604,6 @@ class Empire_Product_API {
 
         // Persist attribute config
         update_post_meta( $product_id, '_product_attributes', $product_attributes_meta );
-
-        // Persist WC object attributes (WITH VALUES)
-        $product->set_attributes( $wc_attributes );
-        $product->save();
 
         // Clear caches
         clean_object_term_cache( $product_id, 'product' );
