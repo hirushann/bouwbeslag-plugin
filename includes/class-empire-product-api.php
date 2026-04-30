@@ -1542,10 +1542,6 @@ class Empire_Product_API {
                         'has_archives' => false,
                     ] );
 
-                    if ( is_wp_error( $attr_id ) ) {
-                        continue;
-                    }
-
                     register_taxonomy(
                         $taxonomy,
                         [ 'product' ],
