@@ -8,9 +8,12 @@ class Empire_Product_API {
 
     private static $instance = null;
     private static $upload_cache = [];
+    private static $acf_field_cache = [];
     private static $rest_acf_assets = [];
     private static $api_url = 'https://empire.dayzsolutions.nl/products-api';
+    // private static $api_url = 'https://empire2.dayzsolutions.com/products-api';
     private static $api_token = '1969a86944e633bbac66bb64761a15b17ef9e34cee7461968a6a8e30d0afadc5';
+    // private static $api_token = '1969a86944e633bbac66bb64761a15b17ef9e34cee7461968a6a8e30d0afadc5';
     private static $ftp_conn = null;
 
     public static function init() {
@@ -248,6 +251,8 @@ class Empire_Product_API {
             @set_time_limit(0); 
         }
 
+        self::log("Empire Sync: Handle sync manual trigger started.");
+
         $page = 1;
         $index_offset = 0;
         
@@ -260,6 +265,7 @@ class Empire_Product_API {
             $result = self::process_batch( $page, $index_offset );
             
             if ( is_wp_error( $result ) ) {
+                self::log("Empire Sync: Batch error on page $page index $index_offset: " . $result->get_error_message());
                 break;
             }
 
@@ -311,12 +317,23 @@ class Empire_Product_API {
             wp_send_json_error( 'Unauthorized' );
         }
 
+        // Catch Fatal Errors and log them
+        register_shutdown_function(function() {
+            $error = error_get_last();
+            if ( $error && in_array($error['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR]) ) {
+                self::log("Empire Sync FATAL ERROR: " . $error['message'] . " in " . $error['file'] . " on line " . $error['line']);
+            }
+        });
+
         $page = isset( $_POST['page'] ) ? absint( $_POST['page'] ) : 1;
         $index_offset = isset( $_POST['index_offset'] ) ? absint( $_POST['index_offset'] ) : 0;
         
+        self::log("Empire Sync: Ajax sync step - Page: $page, Index: $index_offset");
+
         try {
             $result = self::process_batch( $page, $index_offset );
         } catch (Exception $e) {
+            self::log("Empire Sync: Ajax step exception: " . $e->getMessage());
             self::close_ftp_connection();
             wp_send_json_error( $e->getMessage() );
             return;
@@ -325,6 +342,7 @@ class Empire_Product_API {
         self::close_ftp_connection();
 
         if ( is_wp_error( $result ) ) {
+            self::log("Empire Sync: Ajax step WP Error: " . $result->get_error_message());
             wp_send_json_error( $result->get_error_message() );
         }
 
@@ -367,6 +385,9 @@ class Empire_Product_API {
         $items = [];
         if ( isset( $data['data'] ) && is_array( $data['data'] ) ) {
             $items = $data['data'];
+        } elseif ( is_array( $data ) && ( isset( $data['fields'] ) || isset( $data['product_id'] ) ) ) {
+            // Support flat response (single product)
+            $items = [ $data ];
         }
 
         $count = count( $items );
@@ -384,6 +405,7 @@ class Empire_Product_API {
                 
                 // Time Check
                 if ( (time() - $start_time) > $max_execution_time ) {
+                    self::log("Empire Sync: Time limit reached on item $i, page $page.");
                     self::close_ftp_connection();
                     return [
                         'processed' => $processed_in_batch,
@@ -424,6 +446,7 @@ class Empire_Product_API {
                         $skipped++;
                     }
                 } catch ( Exception $e ) {
+                    self::log("Empire Sync Error: Item exception for SKU {$product_sku}: " . $e->getMessage());
                     $skipped++;
                 }
                 $processed_in_batch++;
@@ -875,6 +898,9 @@ class Empire_Product_API {
         return (string) $value;
     }
 
+    /**
+     * Update product USPs from API, mapping into ACF repeater in description group.
+     */
     private static function update_product_usps_from_api( $item ) {
         if ( empty( $item['fields']['crucial']['product_sku'] ) ) {
             return false;
@@ -894,21 +920,33 @@ class Empire_Product_API {
 
         $usp_data = $desc_data['usp'];
 
-        $description_group = get_field('description', $product_id);
-        if ( ! is_array( $description_group ) ) {
-            $description_group = [];
-        }
+        // Get existing group data
+        $group_name = 'description';
+        $group_field = self::get_acf_field_by_name_robust( $group_name, 'group' );
+        if ( ! $group_field ) return false;
 
-        for ( $i = 1; $i <= 8; $i++ ) {
-            $key = "usp_{$i}";
-            $val = isset($usp_data[$key]) ? sanitize_text_field($usp_data[$key]) : '';
-            $description_group[$key] = $val;
-        }
+        $formatted_data = get_field( $group_name, $product_id ) ?: [];
 
-        update_field('description', $description_group, $product_id);
+        // Build repeater rows for usps_repeater
+        $rows = [];
+        foreach ( $usp_data as $key => $val ) {
+            if ( empty( $val ) && $val !== '0' ) continue;
+            if ( preg_match( '/^usp_(\d+)$/', $key ) ) {
+                $rows[] = [ 'usp' => sanitize_text_field( $val ) ];
+            }
+        }
+        $formatted_data['usps_repeater'] = $rows;
+
+        // Translate and save
+        $keyed_data = self::translate_names_to_keys( $formatted_data, $group_field );
+        update_field( $group_field['key'], $keyed_data, $product_id );
+
         return true;
     }
 
+    /**
+     * Update product descriptions from API, mapping description fields into ACF group.
+     */
     /**
      * Update product descriptions from API, mapping description fields into ACF group.
      */
@@ -929,19 +967,28 @@ class Empire_Product_API {
             return false;
         }
 
-        // Read existing description group (if any) to avoid overwriting other subfields
-        $description_group = get_field('description', $product_id);
-        if ( ! is_array( $description_group ) ) {
-            $description_group = [];
-        }
+        // Get existing group data
+        $group_name = 'description';
+        $group_field = self::get_acf_field_by_name_robust( $group_name, 'group' );
+        if ( ! $group_field ) return false;
 
-        $desc_keys = [ 'description', 'description_1', 'description_2', 'description_3', 'description_4', 'description_5' ];
-        foreach ( $desc_keys as $key ) {
-            $val = isset($desc_data[$key]) ? sanitize_textarea_field($desc_data[$key]) : '';
-            $description_group[$key] = $val;
-        }
+        $formatted_data = get_field( $group_name, $product_id ) ?: [];
 
-        update_field('description', $description_group, $product_id);
+        // Build repeater rows for descriptions_repeater
+        $rows = [];
+        foreach ( $desc_data as $key => $val ) {
+            if ( empty( $val ) && $val !== '0' ) continue;
+            // Match: 'description' (base), 'description_1', 'description_2', etc.
+            if ( preg_match( '/^description(?:_(\d+))?$/', $key ) ) {
+                $rows[] = [ 'description' => wp_kses_post( $val ) ];
+            }
+        }
+        $formatted_data['descriptions_repeater'] = $rows;
+
+        // Translate and save
+        $keyed_data = self::translate_names_to_keys( $formatted_data, $group_field );
+        update_field( $group_field['key'], $keyed_data, $product_id );
+
         return true;
     }
 
@@ -1006,80 +1053,6 @@ class Empire_Product_API {
 
         return true;
     }
-
-    // private static function upload_media_from_url( $url, $type = 'image' ) {
-    //     if ( empty( $url ) ) {
-    //         return '';
-    //     }
-
-    //     $tmp = '';
-
-    //     if ( strpos( $url, 'empire/' ) === 0 ) {
-    //         $ftp_server = "u431887.your-storagebox.de";
-    //         $ftp_user   = "u431887";
-    //         $ftp_pass   = "B2swHwPKxSnWUEvc";
-
-    //         $ftp_conn = ftp_ssl_connect( $ftp_server, 21, 10 );
-    //         if ( $ftp_conn && ftp_login( $ftp_conn, $ftp_user, $ftp_pass ) ) {
-    //             ftp_pasv( $ftp_conn, true );
-    //             ftp_set_option($ftp_conn, FTP_TIMEOUT_SEC, 10);
-
-    //             $tmp = wp_tempnam( basename( $url ) );
-    //             $remote_path = '/' . ltrim( $url, '/' );
-
-    //             $filename = basename($url);
-    //             $existing = get_page_by_title($filename, OBJECT, 'attachment');
-    //             if ($existing) {
-    //                 ftp_close($ftp_conn);
-    //                 return $existing->ID;
-    //             }
-
-    //             if ( ftp_get( $ftp_conn, $tmp, $remote_path, FTP_BINARY ) ) {
-    //             } else {
-    //                 ftp_close( $ftp_conn );
-    //                 return '';
-    //             }
-
-    //             ftp_close( $ftp_conn );
-    //         } else {
-    //             return '';
-    //         }
-    //     } else {
-    //         // Standard HTTP(S) download
-    //         if ( ! filter_var( $url, FILTER_VALIDATE_URL ) ) {
-    //             return '';
-    //         }
-    //         $tmp = download_url( $url );
-    //         if ( is_wp_error( $tmp ) ) {
-    //             return '';
-    //         }
-    //     }
-    //     $file = [
-    //         'name'     => basename( parse_url( $url, PHP_URL_PATH ) ),
-    //         'type'     => mime_content_type( $tmp ),
-    //         'tmp_name' => $tmp,
-    //         'error'    => 0,
-    //         'size'     => filesize( $tmp ),
-    //     ];
-    //     $overrides = [ 'test_form' => false ];
-    //     $results = wp_handle_sideload( $file, $overrides );
-    //     if ( isset( $results['error'] ) ) {
-    //         @unlink( $tmp );
-    //         return '';
-    //     }
-    //     $attachment = [
-    //         'post_mime_type' => $results['type'],
-    //         'post_title'     => sanitize_file_name( basename( $url ) ),
-    //         'post_content'   => '',
-    //         'post_status'    => 'inherit',
-    //     ];
-    //     $attach_id = wp_insert_attachment( $attachment, $results['file'] );
-    //     require_once ABSPATH . 'wp-admin/includes/image.php';
-    //     $attach_data = wp_generate_attachment_metadata( $attach_id, $results['file'] );
-    //     wp_update_attachment_metadata( $attach_id, $attach_data );
-    //     $uploaded_url = wp_get_attachment_url( $attach_id );
-    //     return $attach_id;
-    // }
 
     private static function get_ftp_connection() {
         if ( self::$ftp_conn ) {
@@ -1503,166 +1476,6 @@ class Empire_Product_API {
         update_field( 'description_meta_description', $meta_description, $product_id );
     }
 
-    /**
-     * Update WooCommerce product attributes and terms from API attributes.
-     * This version writes directly to _product_attributes post meta, ensuring attributes appear in the Attributes tab.
-     */
-    // private static function update_product_attributes_from_api($item) {
-    //     if (empty($item['fields']['crucial']['product_sku'])) {
-    //         return false;
-    //     }
-
-    //     $sku = sanitize_text_field($item['fields']['crucial']['product_sku']);
-    //     $product_id = wc_get_product_id_by_sku($sku);
-
-    //     if (!$product_id) {
-    //         return false;
-    //     }
-
-    //     $attributes = $item['fields']['attributes'] ?? [];
-    //     if (empty($attributes) || !is_array($attributes)) {
-    //         return false;
-    //     }
-
-    //     $product = wc_get_product($product_id);
-
-
-    //     // Flatten the nested attributes array
-    //     $flattened_attributes = [];
-    //     $excluded_attributes = ['package_content'];
-
-    //     foreach ($attributes as $category => $category_attributes) {
-    //         foreach ($category_attributes as $key => $value) {
-    //             // Skip if value is empty
-    //             if ($value === null || $value === '' || (is_array($value) && empty(array_filter($value)))) {
-    //                 continue;
-    //             }
-
-    //             // Skip excluded attributes
-    //             if (in_array($key, $excluded_attributes)) {
-    //                 continue;
-    //             }
-
-    //              // Handle cam_size array specially - check if it's not empty
-    //             if ($key === 'cam_size' && is_array($value)) {
-    //                 $filtered_array = array_filter($value, function($item) {
-    //                     return $item !== null && $item !== '' && trim($item) !== '';
-    //                 });
-                    
-    //                 if (empty($filtered_array)) {
-    //                     continue; 
-    //                 }
-                    
-    //                 $flattened_attributes[$key] = $value;
-    //                 continue;
-    //             }
-
-    //              // Convert with_core_pulling_protection from 0/1 to no/yes
-    //             if ($key === 'with_core_pulling_protection') {
-    //                 if ($value === 0 || $value === '0') {
-    //                     $value = 'no';
-    //                 } elseif ($value === 1 || $value === '1') {
-    //                     $value = 'yes';
-    //                 }
-    //             }
-                
-    //             // Add to flattened array
-    //             $flattened_attributes[$key] = $value;
-    //         }
-    //     }
-
-    //     // Now process the flattened attributes
-    //     $attributes_data = [];
-    //     $combined_fields = [
-    //         'max_door_thickness' => 'max_door_thickness_unit',
-    //         'min_door_thickness' => 'min_door_thickness_unit',
-    //         // Add other combined field pairs here
-    //     ];
-
-    //     foreach ($flattened_attributes as $key => $value) {
-    //         if (empty($key) || $value === null || $value === '' || (is_array($value) && empty(array_filter($value)))) {
-    //             continue;
-    //         }
-
-    //         // Combine measurement with unit if applicable
-    //         if (isset($combined_fields[$key]) && isset($flattened_attributes[$combined_fields[$key]])) {
-    //             $unit = trim((string)$flattened_attributes[$combined_fields[$key]]);
-    //             $value = trim((string)$value);
-
-    //             // Skip if value is 0.00 (with or without unit)
-    //             if ($value === '0.00' || $value === '0.0' || $value === '0') {
-    //                 continue; 
-    //             }
-
-    //             if ($unit !== '') {
-    //                 $value = "{$value} {$unit}";
-    //             }
-    //         } elseif (in_array($key, $combined_fields)) {
-    //             // Skip unit fields since they are already processed
-    //             continue;
-    //         }
-
-    //         // Normalize array values
-    //         if (is_array($value)) {
-    //             $value = implode(', ', array_filter($value));
-    //         }
-
-    //         $value = trim((string)$value);
-    //         if ($value === '') continue;
-
-    //         $tax_slug = sanitize_title($key);
-    //         $tax_name = 'pa_' . $tax_slug;
-
-    //         // Ensure attribute taxonomy exists
-    //         if (!taxonomy_exists($tax_name)) {
-    //             $attr_result = wc_create_attribute([
-    //                 'slug' => $tax_slug,
-    //                 'name' => ucwords(str_replace('_', ' ', $key)),
-    //                 'type' => 'select',
-    //                 'order_by' => 'menu_order',
-    //                 'has_archives' => false,
-    //             ]);
-    //             if (is_wp_error($attr_result)) {
-    //                 continue;
-    //             }
-    //             register_taxonomy(
-    //                 $tax_name,
-    //                 ['product'],
-    //                 [
-    //                     'hierarchical' => false,
-    //                     'label' => ucwords(str_replace('_', ' ', $key)),
-    //                     'query_var' => true,
-    //                     'rewrite' => ['slug' => $tax_slug],
-    //                     'show_admin_column' => true,
-    //                 ]
-    //             );
-    //         }
-
-    //         // Ensure term exists
-    //         $term = term_exists($value, $tax_name);
-    //         if (!$term) {
-    //             $term = wp_insert_term($value, $tax_name);
-    //             if (is_wp_error($term)) {
-    //                 continue;
-    //             }
-    //         }
-
-    //         // Assign term to product
-    //         wp_set_object_terms($product_id, [$value], $tax_name, false);
-
-    //         // Prepare attribute data for product object
-    //         $attributes_data[$tax_name] = [
-    //             'name' => $tax_name,
-    //             'value' => $value,
-    //             'is_visible' => 1,
-    //             'is_variation' => 0,
-    //             'is_taxonomy' => 1,
-    //         ];
-    //     }
-
-    //     return true;
-    // }
-
     private static function update_product_attributes_from_api( $item ) {
 
         if ( empty( $item['fields']['crucial']['product_sku'] ) ) {
@@ -1817,6 +1630,9 @@ class Empire_Product_API {
      * Update product related fields (order_color, order_model, matching_* fields) from API.
      * Updates each related field individually using update_field().
      */
+    /**
+     * Update product related fields from API.
+     */
     private static function update_product_related_from_api( $item ) {
         if ( empty( $item['fields']['crucial']['product_sku'] ) ) {
             return false;
@@ -1829,36 +1645,77 @@ class Empire_Product_API {
             return false;
         }
 
-        $related_sections = [
-            'order_colors',
-            'order_models',
-            'matching_products',
-            'matching_knobrose',
-            'matching_keyrose',
-            'matching_pcrose',
-            'matching_toiletrose',
-            'must_have_products',
-        ];
-
         $related_data = $item['fields']['related'] ?? [];
         if ( empty( $related_data ) || ! is_array( $related_data ) ) {
             return false;
         }
 
-        foreach ( $related_sections as $section ) {
-            if ( ! empty( $related_data[$section] ) && is_array( $related_data[$section] ) ) {
-                foreach ( $related_data[$section] as $key => $value ) {
-                    $clean_val = sanitize_text_field( $value );
-                    $acf_field = "related_{$key}";
-                    update_field( $acf_field, $clean_val, $product_id );
+        // Get group configuration
+        $group_name = 'related';
+        $group_field = self::get_acf_field_by_name_robust( $group_name, 'group' );
+        if ( ! $group_field ) return false;
+
+        $formatted_data = get_field( $group_name, $product_id ) ?: [];
+
+        $repeater_mappings = [
+            'matching_knobrose'   => [ 'repeater' => 'matching_knobrose_repeater', 'subfield' => 'matching_knobrose' ],
+            'matching_keyrose'    => [ 'repeater' => 'matching_keyrose_repeater', 'subfield' => 'matching_keyrose' ],
+            'matching_pcrose'     => [ 'repeater' => 'matching_pcrose_repeater', 'subfield' => 'matching_pcrose' ],
+            'matching_blindrose'  => [ 'repeater' => 'matching_blindrose_repeater', 'subfield' => 'matching_blindrose' ],
+            'matching_toiletrose' => [ 'repeater' => 'matching_toiletrose_repeater', 'subfield' => 'matching_toiletrose' ],
+            'matching_product'    => [ 'repeater' => 'matching_products_repeater', 'subfield' => 'matching_product' ],
+            'must_have_product'   => [ 'repeater' => 'must_have_products_repeater', 'subfield' => 'must_have_product' ],
+            'must_need_product'   => [ 'repeater' => 'must_have_products_repeater', 'subfield' => 'must_have_product' ],
+            'other_color'         => [ 'repeater' => 'other_colors_repeater', 'subfield' => 'other_color' ],
+            'other_model'         => [ 'repeater' => 'other_models_repeater', 'subfield' => 'other_model' ],
+            'other_model_text'    => [ 'repeater' => 'other_models_repeater', 'subfield' => 'other_model_text' ],
+        ];
+
+        // Flatten the related_data nested structure into something we can iterate over
+        $flat_fields = [];
+        foreach ( $related_data as $section_key => $section_values ) {
+            if ( is_array( $section_values ) ) {
+                foreach ( $section_values as $key => $val ) {
+                    $flat_fields[$key] = $val;
+                }
+            } else {
+                $flat_fields[$section_key] = $section_values;
+            }
+        }
+
+        // Process flat fields into repeater rows
+        $repeater_rows = [];
+        foreach ( $flat_fields as $rel_key => $rel_val ) {
+            if ( empty( $rel_val ) && $rel_val !== '0' ) continue;
+
+            if ( preg_match( '/^(.+)_(\d+)$/', $rel_key, $m ) ) {
+                $base = $m[1];
+                $idx  = intval( $m[2] );
+                if ( isset( $repeater_mappings[ $base ] ) ) {
+                    $rep_conf = $repeater_mappings[ $base ];
+                    $repeater_rows[ $rep_conf['repeater'] ][ $idx ][ $rep_conf['subfield'] ] = sanitize_text_field( $rel_val );
                 }
             }
         }
+
+        // Sort rows and assign to formatted_data
+        foreach ( $repeater_rows as $rep_name => $rows ) {
+            ksort( $rows );
+            $formatted_data[ $rep_name ] = array_values( $rows );
+        }
+
+        // Translate and save
+        $keyed_data = self::translate_names_to_keys( $formatted_data, $group_field );
+        update_field( $group_field['key'], $keyed_data, $product_id );
+
         return true;
     }
 
     /**
      * Update product FAQ fields from API, mapping into ACF group fields.
+     */
+    /**
+     * Update product FAQ fields from API, mapping into ACF repeater in description group.
      */
     private static function update_product_faq_from_api( $item ) {
         if ( empty( $item['fields']['crucial']['product_sku'] ) ) {
@@ -1877,21 +1734,33 @@ class Empire_Product_API {
             return false;
         }
 
-        $description_group = get_field('description', $product_id);
-        if ( ! is_array( $description_group ) ) {
-            $description_group = [];
+        // Get group configuration
+        $group_name = 'description';
+        $group_field = self::get_acf_field_by_name_robust( $group_name, 'group' );
+        if ( ! $group_field ) return false;
+
+        $formatted_data = get_field( $group_name, $product_id ) ?: [];
+
+        // Build repeater rows for faqs_repeater
+        $repeater_rows = [];
+        foreach ( $faq_data as $key => $val ) {
+            if ( empty( $val ) && $val !== '0' ) continue;
+            if ( preg_match( '/^faq_(\d+)_(question|answer)$/', $key, $m ) ) {
+                $idx  = intval( $m[1] );
+                $type = "faq_" . $m[2]; // faq_question or faq_answer
+                $repeater_rows[$idx][$type] = ( $m[2] === 'question' ) ? sanitize_text_field( $val ) : wp_kses_post( $val );
+            }
+        }
+        
+        if ( ! empty( $repeater_rows ) ) {
+            ksort( $repeater_rows );
+            $formatted_data['faqs_repeater'] = array_values( $repeater_rows );
         }
 
-        for ( $i = 1; $i <= 8; $i++ ) {
-            $q_key = "faq_{$i}_question";
-            $a_key = "faq_{$i}_answer";
-            $q_val = isset($faq_data[$q_key]) ? sanitize_text_field($faq_data[$q_key]) : '';
-            $a_val = isset($faq_data[$a_key]) ? sanitize_textarea_field($faq_data[$a_key]) : '';
-            $description_group[$q_key] = $q_val;
-            $description_group[$a_key] = $a_val;
-        }
+        // Translate and save
+        $keyed_data = self::translate_names_to_keys( $formatted_data, $group_field );
+        update_field( $group_field['key'], $keyed_data, $product_id );
 
-        update_field('description', $description_group, $product_id);
         return true;
     }
 
@@ -2093,6 +1962,15 @@ class Empire_Product_API {
                 $key   = $meta_entry['key'];
                 $value = $meta_entry['value'] ?? '';
 
+                // Auto-decode JSON strings to arrays for easier processing
+                $parsed_value = $value;
+                if ( is_string( $value ) && ( strpos( ltrim($value), '{' ) === 0 || strpos( ltrim($value), '[' ) === 0 ) ) {
+                    $decoded = json_decode( $value, true );
+                    if ( json_last_error() === JSON_ERROR_NONE ) {
+                        $parsed_value = $decoded;
+                    }
+                }
+
                 // Single asset fields (one file/image)
                 if ( isset( $asset_meta_keys_single[ $key ] ) ) {
                     if ( ! is_string( $value ) || $value === '' ) {
@@ -2203,6 +2081,110 @@ class Empire_Product_API {
                         $new_meta_data[] = $meta_entry;
                     }
 
+                // Description repeater field
+                } elseif ( $key === 'description_description' && is_array( $value ) ) {
+                    $rows = [];
+                    $texts = [];
+                    foreach ( $parsed_value as $sub_key => $sub_val ) {
+                        if ( ! is_string( $sub_val ) || trim( $sub_val ) === '' ) continue;
+                        if ( preg_match( '/^description_description(?:_(\d+))?$/', $sub_key, $m ) ) {
+                            $idx = isset( $m[1] ) ? (int) $m[1] : 0;
+                            $texts[ $idx ] = wp_kses_post( $sub_val );
+                        }
+                    }
+                    ksort( $texts );
+                    foreach ( $texts as $text ) {
+                        $rows[] = [ 'description' => $text ];
+                    }
+                    $storage_key = ! empty( $sku ) ? $sku : ( $product_id ? (string) $product_id : 'unknown' );
+                    if ( ! isset( self::$rest_acf_assets[ $storage_key ] ) ) self::$rest_acf_assets[ $storage_key ] = [];
+                    if ( ! isset( self::$rest_acf_assets[ $storage_key ]['__groups'] ) ) self::$rest_acf_assets[ $storage_key ]['__groups'] = [];
+                    if ( ! isset( self::$rest_acf_assets[ $storage_key ]['__groups']['description'] ) ) self::$rest_acf_assets[ $storage_key ]['__groups']['description'] = [];
+                    
+                    self::$rest_acf_assets[ $storage_key ]['__groups']['description']['descriptions_repeater'] = $rows;
+
+                // USP repeater field
+                } elseif ( $key === 'description_usp' && is_array( $parsed_value ) ) {
+                    $rows = [];
+                    $texts = [];
+                    foreach ( $parsed_value as $sub_key => $sub_val ) {
+                        if ( ! is_string( $sub_val ) || trim( $sub_val ) === '' ) continue;
+                        if ( preg_match( '/^description_usp(?:_(\d+))?$/', $sub_key, $m ) ) {
+                            $idx = isset( $m[1] ) ? (int) $m[1] : 0;
+                            $texts[ $idx ] = sanitize_text_field( $sub_val );
+                        }
+                    }
+                    ksort( $texts );
+                    foreach ( $texts as $text ) {
+                        $rows[] = [ 'usp' => $text ];
+                    }
+                    $storage_key = ! empty( $sku ) ? $sku : ( $product_id ? (string) $product_id : 'unknown' );
+                    if ( ! isset( self::$rest_acf_assets[ $storage_key ] ) ) self::$rest_acf_assets[ $storage_key ] = [];
+                    if ( ! isset( self::$rest_acf_assets[ $storage_key ]['__groups'] ) ) self::$rest_acf_assets[ $storage_key ]['__groups'] = [];
+                    if ( ! isset( self::$rest_acf_assets[ $storage_key ]['__groups']['description'] ) ) self::$rest_acf_assets[ $storage_key ]['__groups']['description'] = [];
+
+                    self::$rest_acf_assets[ $storage_key ]['__groups']['description']['usps_repeater'] = $rows;
+
+                // FAQ repeater field
+                } elseif ( $key === 'description_faq' && is_array( $parsed_value ) ) {
+                    $faq_rows_raw = [];
+                    foreach ( $parsed_value as $sub_key => $sub_val ) {
+                        if ( ! is_string( $sub_val ) || trim( $sub_val ) === '' ) continue;
+                        if ( preg_match( '/^description_faq_(\d+)_(question|answer)$/', $sub_key, $m ) ) {
+                            $idx   = (int) $m[1];
+                            $field = ($m[2] === 'question') ? 'faq_question' : 'faq_answer';
+                            if ( ! isset( $faq_rows_raw[ $idx ] ) ) {
+                                $faq_rows_raw[ $idx ] = [ 'faq_question' => '', 'faq_answer' => '' ];
+                            }
+                            $faq_rows_raw[ $idx ][ $field ] = ($field === 'faq_question') ? sanitize_text_field( $sub_val ) : wp_kses_post( $sub_val );
+                        }
+                    }
+                    ksort( $faq_rows_raw );
+                    $faq_rows = array_values( array_filter( $faq_rows_raw, function( $r ) {
+                        return ! empty( $r['faq_question'] ) || ! empty( $r['faq_answer'] );
+                    }) );
+
+                    $storage_key = ! empty( $sku ) ? $sku : ( $product_id ? (string) $product_id : 'unknown' );
+                    if ( ! isset( self::$rest_acf_assets[ $storage_key ] ) ) self::$rest_acf_assets[ $storage_key ] = [];
+                    if ( ! isset( self::$rest_acf_assets[ $storage_key ]['__groups'] ) ) self::$rest_acf_assets[ $storage_key ]['__groups'] = [];
+                    if ( ! isset( self::$rest_acf_assets[ $storage_key ]['__groups']['description'] ) ) self::$rest_acf_assets[ $storage_key ]['__groups']['description'] = [];
+
+                    self::$rest_acf_assets[ $storage_key ]['__groups']['description']['faqs_repeater'] = $faq_rows;
+
+                // Related flat fields (collected for post-save processing)
+                } elseif ( strpos( $key, 'related_' ) === 0 ) {
+                    $storage_key = ! empty( $sku ) ? $sku : ( $product_id ? (string) $product_id : 'unknown' );
+                    if ( ! isset( self::$rest_acf_assets[ $storage_key ] ) ) self::$rest_acf_assets[ $storage_key ] = [];
+                    if ( ! isset( self::$rest_acf_assets[ $storage_key ]['__groups'] ) ) self::$rest_acf_assets[ $storage_key ]['__groups'] = [];
+                    if ( ! isset( self::$rest_acf_assets[ $storage_key ]['__groups']['related'] ) ) self::$rest_acf_assets[ $storage_key ]['__groups']['related'] = [];
+                    
+                    self::$rest_acf_assets[ $storage_key ]['__groups']['related'][ $key ] = $value;
+
+                // Crucial Data category (JSON string to array)
+                } elseif ( $key === 'crucial_data_category' ) {
+                    $cats = is_array( $parsed_value ) ? $parsed_value : [];
+                    if ( ! empty( $cats ) ) {
+                        $storage_key = ! empty( $sku ) ? $sku : ( $product_id ? (string) $product_id : 'unknown' );
+                        if ( ! isset( self::$rest_acf_assets[ $storage_key ] ) ) self::$rest_acf_assets[ $storage_key ] = [];
+                        if ( ! isset( self::$rest_acf_assets[ $storage_key ]['__groups'] ) ) self::$rest_acf_assets[ $storage_key ]['__groups'] = [];
+                        if ( ! isset( self::$rest_acf_assets[ $storage_key ]['__groups']['crucial_data'] ) ) self::$rest_acf_assets[ $storage_key ]['__groups']['crucial_data'] = [];
+                        self::$rest_acf_assets[ $storage_key ]['__groups']['crucial_data']['category'] = $cats;
+                    }
+                    $new_meta_data[] = $meta_entry;
+
+                // Handle group objects (crucial_data, dimensions, bol_data, description)
+                } elseif ( in_array( $key, ['crucial_data', 'dimensions', 'bol_data', 'description'] ) && is_array( $parsed_value ) ) {
+                    $storage_key = ! empty( $sku ) ? $sku : ( $product_id ? (string) $product_id : 'unknown' );
+                    if ( ! isset( self::$rest_acf_assets[ $storage_key ] ) ) self::$rest_acf_assets[ $storage_key ] = [];
+                    
+                    if ( ! isset( self::$rest_acf_assets[ $storage_key ]['__groups'] ) ) {
+                        self::$rest_acf_assets[ $storage_key ]['__groups'] = [];
+                    }
+                    // Merge existing group data in cache if any
+                    $current = self::$rest_acf_assets[ $storage_key ]['__groups'][ $key ] ?? [];
+                    self::$rest_acf_assets[ $storage_key ]['__groups'][ $key ] = array_merge( $current, $parsed_value );
+                    $new_meta_data[] = $meta_entry;
+
                 // Non-asset meta fields: keep as-is
                 } else {
                     $new_meta_data[] = $meta_entry;
@@ -2235,7 +2217,8 @@ class Empire_Product_API {
         // We must store important info to be retrieved in the after-save hook
         // Use SKU as key because product_id might be 0 for new products
         $storage_key = !empty($sku) ? $sku : (string)$product_id;
-        self::$rest_acf_assets[$storage_key] = $acf_assets;
+        if ( ! isset( self::$rest_acf_assets[ $storage_key ] ) ) self::$rest_acf_assets[ $storage_key ] = [];
+        self::$rest_acf_assets[$storage_key]['assets'] = $acf_assets;
 
         $final_request_images = [];
         if ( $featured_id ) {
@@ -2269,18 +2252,24 @@ class Empire_Product_API {
 
         $product_id = $product->get_id();
         $sku        = $product->get_sku();
-        self::log( "Empire Sync: Finalizing REST product save for SKU: {$sku} (ID: {$product_id})" );
 
         if ( ! function_exists( 'update_field' ) ) {
             return;
         }
 
-        $acf_assets = [];
-        // Load existing to avoid clearing fields not present in this specific request
-        // (Though usually we want the REST payload to be the source of truth)
+        // Run diagnostic logger once per hour to dump ACF schema
+        self::log_acf_schema_diagnostic();
+
+        self::log( "Empire Sync: Finalizing REST product save for SKU: {$sku} (ID: {$product_id})" );
+
+        $storage_key = ! empty( $sku ) ? $sku : (string) $product_id;
+        $cached = self::$rest_acf_assets[ $storage_key ] ?? ( self::$rest_acf_assets['unknown'] ?? [] );
+
+        $acf_assets = $cached['assets'] ?? [];
+        // Load existing assets to avoid clearing fields not present in this specific request
         $existing = get_field( 'assets', $product_id );
         if ( is_array( $existing ) ) {
-            $acf_assets = $existing;
+            $acf_assets = array_merge( $existing, $acf_assets );
         }
 
         $single_map = [
@@ -2353,9 +2342,237 @@ class Empire_Product_API {
 
         if ( $has_asset_meta ) {
             $saved = update_field( 'assets', $acf_assets, $product_id );
-        } else {
         }
 
+        // Process group objects (including repeaters nested within them)
+        $storage_key = ! empty( $sku ) ? $sku : (string) $product_id;
+        $cached = self::$rest_acf_assets[ $storage_key ] ?? ( self::$rest_acf_assets['unknown'] ?? [] );
+
+        if ( ! empty( $cached['__groups'] ) ) {
+            foreach ( $cached['__groups'] as $group_name => $group_data ) {
+                // Read existing group data to merge
+                $formatted_data = get_field( $group_name, $product_id ) ?: [];
+                
+                // Specific logic for 'related' group which contains flat keys like related_matching_knobrose_1
+                if ( $group_name === 'related' ) {
+                    $repeater_mappings = [
+                        'matching_knobrose'   => [ 'repeater' => 'matching_knobrose_repeater', 'subfield' => 'matching_knobrose' ],
+                        'matching_keyrose'    => [ 'repeater' => 'matching_keyrose_repeater', 'subfield' => 'matching_keyrose' ],
+                        'matching_pcrose'     => [ 'repeater' => 'matching_pcrose_repeater', 'subfield' => 'matching_pcrose' ],
+                        'matching_blindrose'  => [ 'repeater' => 'matching_blindrose_repeater', 'subfield' => 'matching_blindrose' ],
+                        'matching_toiletrose' => [ 'repeater' => 'matching_toiletrose_repeater', 'subfield' => 'matching_toiletrose' ],
+                        'matching_product'    => [ 'repeater' => 'matching_products_repeater', 'subfield' => 'matching_product' ],
+                        'must_have_product'   => [ 'repeater' => 'must_have_products_repeater', 'subfield' => 'must_have_product' ],
+                        'must_need_product'   => [ 'repeater' => 'must_have_products_repeater', 'subfield' => 'must_have_product' ],
+                        'other_color'         => [ 'repeater' => 'other_colors_repeater', 'subfield' => 'other_color' ],
+                        'other_model'         => [ 'repeater' => 'other_models_repeater', 'subfield' => 'other_model' ],
+                        'other_model_text'    => [ 'repeater' => 'other_models_repeater', 'subfield' => 'other_model_text' ],
+                    ];
+
+                    $plain_fields = [ 'pc55', 'pc72', 'sleutel_56' ];
+                    $dash_fields = [ 'wc55_8' => 'wc558', 'wc57_5' => 'wc575', 'wc63_8' => 'wc638', 'wc72_8' => 'wc728' ];
+
+                    // Flatten group_data to support both flat payload and nested payload structures
+                    $flat_related = [];
+                    foreach ( $group_data as $rk => $rv ) {
+                        if ( is_array( $rv ) ) {
+                            foreach ( $rv as $sub_k => $sub_v ) {
+                                $flat_related[ $sub_k ] = $sub_v;
+                            }
+                        } else {
+                            $flat_related[ $rk ] = $rv;
+                        }
+                    }
+
+                    $repeater_rows = [];
+                    foreach ( $flat_related as $rel_key => $rel_val ) {
+                        if ( empty($rel_val) && $rel_val !== '0' ) continue; // Skip nulls and empties
+
+                        if ( preg_match( '/^related_(.+)_(\d+)$/', $rel_key, $m ) ) {
+                            $base = $m[1];
+                            $idx  = (int) $m[2];
+                            if ( isset( $repeater_mappings[ $base ] ) ) {
+                                $rep_name = $repeater_mappings[ $base ]['repeater'];
+                                $sub_name = $repeater_mappings[ $base ]['subfield'];
+                                if ( ! isset( $repeater_rows[ $rep_name ] ) ) $repeater_rows[ $rep_name ] = [];
+                                if ( ! isset( $repeater_rows[ $rep_name ][ $idx ] ) ) $repeater_rows[ $rep_name ][ $idx ] = [];
+                                $repeater_rows[ $rep_name ][ $idx ][ $sub_name ] = sanitize_text_field( $rel_val );
+                            } elseif ( in_array( $base, $plain_fields ) ) {
+                                $formatted_data[ $base ] = sanitize_text_field( $rel_val );
+                            } elseif ( isset( $dash_fields[ $base ] ) ) {
+                                $formatted_data[ $dash_fields[ $base ] ] = sanitize_text_field( $rel_val );
+                            }
+                        }
+                    }
+                    foreach ( $repeater_rows as $rep_name => $rows ) {
+                        ksort( $rows );
+                        $formatted_data[ $rep_name ] = array_values( $rows );
+                    }
+                } else {
+                    // Standard group object processing
+                    foreach ( $group_data as $sub_key => $sub_val ) {
+                        // Strip group prefix (e.g., crucial_data_product_name -> product_name)
+                        $clean_key = str_replace( $group_name . '_', '', $sub_key );
+                        
+                        if ( is_array( $sub_val ) ) {
+                            // If it's a repeater row set, use as is
+                            $formatted_data[ $clean_key ] = $sub_val;
+                        } else {
+                            $formatted_data[ $clean_key ] = $sub_val;
+                        }
+                    }
+                }
+
+                if ( ! empty( $formatted_data ) ) {
+                    $group_field = self::get_acf_field_by_name_robust( $group_name, 'group' );
+                    if ( $group_field ) {
+                        $keyed_data = self::translate_names_to_keys( $formatted_data, $group_field );
+                        
+                        self::log( "Empire Sync DEBUG: Keyed data prepared for group '{$group_name}' ({$group_field['key']}):\n" . print_r( $keyed_data, true ) );
+                        
+                        update_field( $group_field['key'], $keyed_data, $product_id );
+                    } else {
+                        self::log( "Empire Sync DEBUG: Could not find robust definition for group '{$group_name}'. Falling back to name-based update." );
+                        update_field( $group_name, $formatted_data, $product_id );
+                    }
+                    self::log( "Empire Sync: Updated group {$group_name} using dynamic field mapping for SKU: {$sku}" );
+                }
+            }
+        }
+
+        // Clean up cache entry
+        unset( self::$rest_acf_assets[ $storage_key ] );
+        if ( ! empty( self::$rest_acf_assets['unknown'] ) ) {
+            unset( self::$rest_acf_assets['unknown'] );
+        }
+
+    }
+
+    /**
+     * Dumps the ACF field schema to the WooCommerce logger to verify field names across sites.
+     * Runs only once per hour to avoid log spam.
+     */
+    public static function log_acf_schema_diagnostic() {
+        if ( ! function_exists('acf_get_field_groups') ) return;
+        
+        // Prevent running multiple times
+        if ( get_transient('empire_acf_schema_logged') ) return;
+        set_transient('empire_acf_schema_logged', true, HOUR_IN_SECONDS);
+
+        $groups = acf_get_field_groups();
+        $schema = [];
+        foreach ( $groups as $group ) {
+            $fields = acf_get_fields( $group['key'] );
+            if ( $fields ) {
+                $schema[ $group['title'] ] = self::extract_acf_fields_recursive( $fields );
+            }
+        }
+        
+        self::log( "=== Empire Sync ACF Schema Diagnostic ===\n" . print_r( $schema, true ) . "\n=========================================" );
+    }
+
+    private static function extract_acf_fields_recursive( $fields ) {
+        $result = [];
+        foreach ( $fields as $field ) {
+            $info = [
+                'name' => $field['name'],
+                'type' => $field['type']
+            ];
+            if ( ! empty( $field['sub_fields'] ) ) {
+                $info['sub_fields'] = self::extract_acf_fields_recursive( $field['sub_fields'] );
+            }
+            $result[] = $info;
+        }
+        return $result;
+    }
+
+    /**
+     * Securely fetch an ACF field definition by its name, searching all groups as a fallback.
+     */
+    private static function get_acf_field_by_name_robust( $name, $type = '' ) {
+        if ( ! function_exists( 'acf_get_field_groups' ) ) return false;
+
+        $cache_key = $name . ( ! empty( $type ) ? '_' . $type : '' );
+        if ( isset( self::$acf_field_cache[ $cache_key ] ) ) {
+            return self::$acf_field_cache[ $cache_key ];
+        }
+        
+        $groups = acf_get_field_groups();
+        foreach ( $groups as $group ) {
+            $fields = acf_get_fields( $group['key'] );
+            if ( ! is_array( $fields ) ) continue;
+            
+            foreach ( $fields as $field ) {
+                if ( $field['name'] === $name ) {
+                    if ( ! empty( $type ) && $field['type'] !== $type ) continue;
+                    self::$acf_field_cache[ $cache_key ] = $field;
+                    return $field;
+                }
+            }
+        }
+        self::$acf_field_cache[ $cache_key ] = false;
+        return false;
+    }
+
+    /**
+     * Recursively maps an array keyed by field names into an array keyed by exact ACF field keys.
+     */
+    private static function translate_names_to_keys( $data, $fields_context ) {
+        if ( ! is_array( $data ) ) return $data;
+
+        // Determine correct field definitions
+        $acf_fields = [];
+        if ( isset( $fields_context['sub_fields'] ) ) {
+            $acf_fields = $fields_context['sub_fields'];
+        } elseif ( isset( $fields_context[0]['key'] ) ) {
+            $acf_fields = $fields_context;
+        } elseif ( isset( $fields_context['key'] ) ) {
+            // It's a single field object (likely a group or repeater)
+            $full_field = acf_get_field( $fields_context['key'] );
+            $acf_fields = $full_field['sub_fields'] ?? [];
+        }
+
+        $result = [];
+        foreach ( $data as $name => $value ) {
+            $field_def = null;
+            foreach ( $acf_fields as $f ) {
+                if ( $f['name'] === $name ) {
+                    $field_def = $f;
+                    break;
+                }
+            }
+
+            if ( $field_def ) {
+                $key = $field_def['key'];
+                
+                // Ensure sub_fields are populated for repeaters/groups
+                if ( ! isset( $field_def['sub_fields'] ) && in_array( $field_def['type'], ['repeater', 'group', 'clone'] ) ) {
+                    $full_field = acf_get_field( $key );
+                    if ( $full_field && isset( $full_field['sub_fields'] ) ) {
+                        $field_def['sub_fields'] = $full_field['sub_fields'];
+                    }
+                }
+
+                if ( is_array( $value ) && isset( $value[0] ) && is_array( $value[0] ) ) {
+                    // Repeater array
+                    $rows = [];
+                    foreach ( $value as $row ) {
+                        $rows[] = self::translate_names_to_keys( $row, $field_def['sub_fields'] ?? [] );
+                    }
+                    $result[ $key ] = $rows;
+                } elseif ( is_array( $value ) && in_array( $field_def['type'], ['group', 'clone'] ) ) {
+                    // Group object
+                    $result[ $key ] = self::translate_names_to_keys( $value, $field_def['sub_fields'] ?? [] );
+                } else {
+                    // Simple value
+                    $result[ $key ] = $value;
+                }
+            } else {
+                // Fallback: if not found in schema, keep original name
+                $result[ $name ] = $value;
+            }
+        }
+        return $result;
     }
 
     // public static function log_rest_product_query($args, $request) {

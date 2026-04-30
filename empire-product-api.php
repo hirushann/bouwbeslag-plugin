@@ -2,8 +2,8 @@
 /**
  * Plugin Name: Sync Products from Empire API
  * Description: Retrieve products from an external API and sync with WooCommerce.
- * Version: 1.0.0
- * Author: Hirushan
+ * Version: 2.0.0
+ * Author: Hirushan Perera
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
