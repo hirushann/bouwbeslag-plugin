@@ -1500,14 +1500,25 @@ class Empire_Product_API {
             $existing_meta = [];
         }
 
+        // Normalize attributes into a flat [ key => value ] map.
+        // The Empire API returns a flat object: {"material": "RVS", "color": "Black"}
+        // but guard against nested group arrays too.
+        $flat_attributes = [];
+        foreach ( $attributes as $key => $value ) {
+            if ( is_int( $key ) && is_array( $value ) ) {
+                // Nested group format: [ [ "key" => "val" ], ... ]
+                foreach ( $value as $k => $v ) {
+                    $flat_attributes[ $k ] = $v;
+                }
+            } else {
+                // Flat format: { "key": "val", ... }
+                $flat_attributes[ $key ] = $value;
+            }
+        }
+
         $added = false;
 
-        foreach ( $attributes as $group ) {
-            if ( ! is_array( $group ) ) {
-                continue;
-            }
-
-            foreach ( $group as $key => $raw_value ) {
+        foreach ( $flat_attributes as $key => $raw_value ) {
 
                 if ( $raw_value === null || $raw_value === '' ) {
                     continue;
@@ -1605,7 +1616,6 @@ class Empire_Product_API {
 
                 $added = true;
             }
-        }
 
         if ( ! $added ) {
             return false;
