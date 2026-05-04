@@ -500,27 +500,33 @@ class Empire_Product_API {
         $product_regular_price = $crucial_data['b2b_and_b2c']['salesprice_b2c'] ?? 0;
         $formatted_price = round((float) $product_regular_price, 2);
 
-        // Create the product first to ensure we have an ID
+        // Set product data
         $product->set_name( $name );
         $product->set_regular_price( $formatted_price );
         $product->set_sale_price( '' );
         $product->set_price( $formatted_price );
         $product->set_sku( $sku );
-        $product->set_stock_quantity( $stock );
+
+        // Stock management logic - ensuring numeric value
+        $stock_value = floatval( $stock );
         $product->set_manage_stock( true );
+        $product->set_stock_quantity( $stock_value );
+        $product->set_stock_status( $stock_value > 0 ? 'instock' : 'outofstock' );
 
-        $product_id = $product->save(); // Save to generate ID
+        $product_id = $product->save(); // Save to generate/update ID
 
-        // Update stock meta specifically (redundant but safe)
-        wc_update_product_stock($product_id, $stock, 'set');
-        update_post_meta($product_id, '_stock', $stock);
-        update_post_meta($product_id, '_stock_status', $stock > 0 ? 'instock' : 'outofstock');
-        wc_delete_product_transients($product_id);
+        // Explicit meta updates for safety (redundant but helps with some third-party plugins)
+        update_post_meta( $product_id, '_regular_price', $formatted_price );
+        update_post_meta( $product_id, '_price', $formatted_price );
+        update_post_meta( $product_id, '_manage_stock', 'yes' );
+        update_post_meta( $product_id, '_stock', $stock_value );
+        update_post_meta( $product_id, '_stock_status', $stock_value > 0 ? 'instock' : 'outofstock' );
+        
+        // Ensure WC stock system is fully aware
+        if ( function_exists( 'wc_update_product_stock' ) ) {
+            wc_update_product_stock( $product_id, $stock_value, 'set' );
+        }
 
-        $product = wc_get_product($product_id); // Reload to be safe
-
-        update_post_meta( $product->get_id(), '_regular_price', $formatted_price );
-        update_post_meta( $product->get_id(), '_price', $formatted_price );
 
         // We prioritize 'product_ean_code' as the source key from API/ACF data.
         $ean = $crucial_data['product_ean_code'];
@@ -567,6 +573,7 @@ class Empire_Product_API {
         // }
 
         //Save product Description(short and long)
+        // Save product Description (short and long)
         if ( ! empty( $desc_data['description']['description'] ) ) {
             $raw_desc = $desc_data['description']['description'];
 
@@ -576,15 +583,8 @@ class Empire_Product_API {
                 $desc_string = wp_kses_post( (string) $raw_desc );
             }
 
-            wp_update_post( [
-                'ID'           => $product_id,
-                'post_content' => $desc_string,
-            ] );
-
-            wp_update_post( [
-                'ID'           => $product_id,
-                'post_excerpt' => wp_trim_words( strip_tags( $desc_string ), 55 ),
-            ] );
+            $product->set_description( $desc_string );
+            $product->set_short_description( wp_trim_words( strip_tags( $desc_string ), 55 ) );
         }
 
 
@@ -594,6 +594,11 @@ class Empire_Product_API {
         // update_post_meta( $product->get_id(), '_alternate_sku_1', $crucial_data['product_alternate_sku_1'] ?? '' );
         // update_post_meta( $product->get_id(), '_alternate_sku_2', $crucial_data['product_alternate_sku_2'] ?? '' );
         update_field('crucial_data', $crucial_data, $product->get_id());
+
+        // Final enforcement of stock data before final save to prevent overwrites
+        $product->set_manage_stock( true );
+        $product->set_stock_quantity( $stock_value );
+        $product->set_stock_status( $stock_value > 0 ? 'instock' : 'outofstock' );
 
         $product->save();
 
