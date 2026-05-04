@@ -251,8 +251,6 @@ class Empire_Product_API {
             @set_time_limit(0); 
         }
 
-        self::log("Empire Sync: Handle sync manual trigger started.");
-
         $page = 1;
         $index_offset = 0;
         
@@ -264,10 +262,10 @@ class Empire_Product_API {
         do {
             $result = self::process_batch( $page, $index_offset );
             
-            if ( is_wp_error( $result ) ) {
-                self::log("Empire Sync: Batch error on page $page index $index_offset: " . $result->get_error_message());
-                break;
-            }
+            // if ( is_wp_error( $result ) ) {
+            //     self::log("Empire Sync: Batch error on page $page index $index_offset: " . $result->get_error_message());
+            //     break;
+            // }
 
             $created_count += $result['created'];
             $updated_count += $result['updated'];
@@ -327,13 +325,11 @@ class Empire_Product_API {
 
         $page = isset( $_POST['page'] ) ? absint( $_POST['page'] ) : 1;
         $index_offset = isset( $_POST['index_offset'] ) ? absint( $_POST['index_offset'] ) : 0;
-        
-        self::log("Empire Sync: Ajax sync step - Page: $page, Index: $index_offset");
+    
 
         try {
             $result = self::process_batch( $page, $index_offset );
         } catch (Exception $e) {
-            self::log("Empire Sync: Ajax step exception: " . $e->getMessage());
             self::close_ftp_connection();
             wp_send_json_error( $e->getMessage() );
             return;
@@ -341,10 +337,10 @@ class Empire_Product_API {
 
         self::close_ftp_connection();
 
-        if ( is_wp_error( $result ) ) {
-            self::log("Empire Sync: Ajax step WP Error: " . $result->get_error_message());
-            wp_send_json_error( $result->get_error_message() );
-        }
+        // if ( is_wp_error( $result ) ) {
+        //     self::log("Empire Sync: Ajax step WP Error: " . $result->get_error_message());
+        //     wp_send_json_error( $result->get_error_message() );
+        // }
 
         wp_send_json_success( $result );
     }
@@ -405,7 +401,6 @@ class Empire_Product_API {
                 
                 // Time Check
                 if ( (time() - $start_time) > $max_execution_time ) {
-                    self::log("Empire Sync: Time limit reached on item $i, page $page.");
                     self::close_ftp_connection();
                     return [
                         'processed' => $processed_in_batch,
@@ -446,7 +441,7 @@ class Empire_Product_API {
                         $skipped++;
                     }
                 } catch ( Exception $e ) {
-                    self::log("Empire Sync Error: Item exception for SKU {$product_sku}: " . $e->getMessage());
+                    // self::log("Empire Sync Error: Item exception for SKU {$product_sku}: " . $e->getMessage());
                     $skipped++;
                 }
                 $processed_in_batch++;
@@ -467,7 +462,6 @@ class Empire_Product_API {
     private static function create_or_update_product( $item, $crucial_data = [] ) {
 
         if ( empty( $crucial_data ) ) {
-            self::log( "Empire Sync: Skipping item because crucial/item data is empty." );
             return 'skipped';
         }
 
@@ -478,7 +472,15 @@ class Empire_Product_API {
         $bouwbeslag_title = $item['fields']['description']['meta_data']['bouwbeslag_title'];
         $name  =  $bouwbeslag_title ?? $crucial_data['product_name'] ?? null;
         $price = $crucial_data['unit_price'] ?? 0;
-        $stock = $crucial_data['own_stock'] ?? $crucial_data['total_stock'] ?? 0;
+        $own_stock   = $crucial_data['own_stock'] ?? 'N/A';
+        $total_stock = $crucial_data['total_stock'] ?? 'N/A';
+        
+        // Prioritize total_stock as requested by user
+        $stock = $crucial_data['total_stock'] ?? 0;
+        
+        self::log("Empire Sync [SKU: $sku]: Raw Stock Data - own_stock: $own_stock, total_stock: $total_stock. Selected for sync: $stock");
+
+
         $brand = $crucial_data['brand'] ?? $crucial_data['crucial_data_brand'] ?? '';
         $supplier = $crucial_data['supplier'] ?? '';
 
@@ -509,11 +511,21 @@ class Empire_Product_API {
 
         // Stock management logic - ensuring numeric value
         $stock_value = floatval( $stock );
+        self::log("Empire Sync [SKU: $sku]: Calculated stock_value to sync: $stock_value");
+
+        // Update ACF data to match the synced total_stock value
+        if ( is_array( $crucial_data ) ) {
+            $crucial_data['total_stock'] = $stock_value;
+        }
+
         $product->set_manage_stock( true );
         $product->set_stock_quantity( $stock_value );
         $product->set_stock_status( $stock_value > 0 ? 'instock' : 'outofstock' );
 
+
         $product_id = $product->save(); // Save to generate/update ID
+        self::log("Empire Sync [SKU: $sku]: Initial save complete. ID: $product_id. Object Stock: " . $product->get_stock_quantity());
+
 
         // Explicit meta updates for safety (redundant but helps with some third-party plugins)
         update_post_meta( $product_id, '_regular_price', $formatted_price );
@@ -524,8 +536,10 @@ class Empire_Product_API {
         
         // Ensure WC stock system is fully aware
         if ( function_exists( 'wc_update_product_stock' ) ) {
-            wc_update_product_stock( $product_id, $stock_value, 'set' );
+            $sync_res = wc_update_product_stock( $product_id, $stock_value, 'set' );
+            self::log("Empire Sync [SKU: $sku]: wc_update_product_stock called. Resulting stock: $sync_res");
         }
+
 
 
         // We prioritize 'product_ean_code' as the source key from API/ACF data.
@@ -601,6 +615,8 @@ class Empire_Product_API {
         $product->set_stock_status( $stock_value > 0 ? 'instock' : 'outofstock' );
 
         $product->save();
+        self::log("Empire Sync [SKU: $sku]: Final save complete. Final Object Stock: " . $product->get_stock_quantity() . ". DB Meta _stock: " . get_post_meta($product_id, '_stock', true));
+
 
         $product_id = $product->get_id();
         // Fetch assets from either top-level or fields-level to handle API variations
