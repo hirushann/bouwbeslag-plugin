@@ -249,6 +249,12 @@ function prepare_category_fields( $response, $item, $request ) {
     } else {
         $response->data['acf'] = null;
     }
+
+    if ( function_exists( 'wc_get_logger' ) ) {
+        $logger = wc_get_logger();
+        $logger->debug( 'Sending category data from REST API: ' . print_r( $response->data, true ), array( 'source' => 'category-api-debug' ) );
+    }
+
     return $response;
 }
 add_filter( 'woocommerce_rest_prepare_product_cat', 'prepare_category_fields', 10, 3 );
@@ -923,3 +929,59 @@ add_action('woocommerce_order_item_meta_end', function($item_id, $item, $order, 
     }
 
 }, 10, 4);
+
+/**
+ * Add "Log to WC Logger" button to Product Category row actions
+ */
+add_filter( 'product_cat_row_actions', 'add_category_logger_row_action', 10, 2 );
+function add_category_logger_row_action( $actions, $tag ) {
+    $url = wp_nonce_url( admin_url( 'admin-ajax.php?action=log_category_to_wc&term_id=' . $tag->term_id ), 'log_category_' . $tag->term_id );
+    $actions['log_to_wc'] = sprintf( '<a href="%s" target="_blank" style="color: #d63638; font-weight: 500;">Log to WC Logger</a>', esc_url( $url ) );
+    return $actions;
+}
+
+add_action( 'wp_ajax_log_category_to_wc', 'handle_log_category_to_wc' );
+function handle_log_category_to_wc() {
+    if ( ! current_user_can( 'manage_categories' ) ) {
+        wp_die( 'Unauthorized' );
+    }
+    
+    $term_id = isset( $_GET['term_id'] ) ? intval( $_GET['term_id'] ) : 0;
+    check_admin_referer( 'log_category_' . $term_id );
+    
+    $term = get_term( $term_id, 'product_cat' );
+    if ( ! $term || is_wp_error( $term ) ) {
+        wp_die( 'Invalid term' );
+    }
+    
+    $data = array(
+        'id'          => $term->term_id,
+        'name'        => $term->name,
+        'slug'        => $term->slug,
+        'description' => $term->description,
+        'parent'      => $term->parent,
+        'count'       => $term->count,
+    );
+    
+    if ( function_exists( 'get_fields' ) ) {
+        $data['acf'] = get_fields( 'product_cat_' . $term->term_id );
+    } else {
+        $data['acf'] = null;
+    }
+    
+    if ( function_exists( 'wc_get_logger' ) ) {
+        $logger = wc_get_logger();
+        $logger->debug( 'Manual Log - Category Data: ' . print_r( $data, true ), array( 'source' => 'category-api-debug' ) );
+        echo "<div style='font-family: sans-serif; max-width: 800px; margin: 40px auto; color: #333;'>";
+        echo "<h2 style='color: #46b450;'>Successfully logged category!</h2>";
+        echo "<p><strong>ID:</strong> {$term_id} <br><strong>Name:</strong> {$term->name}</p>";
+        echo "<p>You can check the full log under <strong>WooCommerce &gt; Status &gt; Logs &gt; category-api-debug</strong></p>";
+        echo "<h3>Payload Data:</h3>";
+        echo "<pre style='background:#f0f0f1; padding:20px; border:1px solid #c3c4c7; overflow:auto; border-radius: 4px;'>" . esc_html(print_r($data, true)) . "</pre>";
+        echo "<br><a href='javascript:window.close();' style='display:inline-block; padding:10px 20px; background:#2271b1; color:#fff; text-decoration:none; border-radius:3px; font-weight: bold;'>Close Window</a>";
+        echo "</div>";
+    } else {
+        echo "WooCommerce Logger not found.";
+    }
+    wp_die();
+}
