@@ -964,10 +964,14 @@ function handle_log_category_to_wc() {
     );
     
     if ( function_exists( 'get_fields' ) ) {
-        $data['acf'] = get_fields( 'product_cat_' . $term->term_id );
+        $data['acf_product_cat'] = get_fields( 'product_cat_' . $term->term_id );
+        $data['acf_term']        = get_fields( 'term_' . $term->term_id );
     } else {
         $data['acf'] = null;
     }
+    
+    // Also grab raw term meta for debugging
+    $data['raw_term_meta'] = get_term_meta( $term->term_id );
     
     if ( function_exists( 'wc_get_logger' ) ) {
         $logger = wc_get_logger();
