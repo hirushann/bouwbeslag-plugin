@@ -245,7 +245,22 @@ function prepare_category_fields( $response, $item, $request ) {
     }
     // 'product_cat_' is the required prefix for WooCommerce product category terms
     if ( function_exists( 'get_fields' ) ) {
-        $response->data['acf'] = get_fields( $item->taxonomy . '_' . $item->term_id );
+        $acf = get_fields( $item->taxonomy . '_' . $item->term_id );
+        if ( ! is_array( $acf ) ) {
+            $acf = [];
+        }
+        // Merge in defaults for new fields that may not be saved yet in the DB
+        $acf_defaults = [
+            'brands'       => true,
+            'in_stock'     => true,
+            'price_slider' => true,
+        ];
+        foreach ( $acf_defaults as $key => $default ) {
+            if ( ! array_key_exists( $key, $acf ) ) {
+                $acf[ $key ] = $default;
+            }
+        }
+        $response->data['acf'] = $acf;
     } else {
         $response->data['acf'] = null;
     }
