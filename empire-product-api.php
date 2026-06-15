@@ -243,56 +243,9 @@ function prepare_category_fields( $response, $item, $request ) {
     if ( empty( $response->data ) ) {
         return $response;
     }
-
-    $term_id = $item->term_id;
-
-    // Clear the object cache so we always get the latest saved values from the DB.
-    clean_term_cache( $term_id, $item->taxonomy );
-    wp_cache_delete( $term_id, $item->taxonomy . '_relationships' );
-
+    // 'product_cat_' is the required prefix for WooCommerce product category terms
     if ( function_exists( 'get_fields' ) ) {
-        // Force ACF to bypass its internal cache by deleting its cache key before calling get_fields.
-        $acf_cache_key = 'acf_get_metadata_' . $item->taxonomy . '_' . $term_id;
-        wp_cache_delete( $acf_cache_key, 'acf' );
-
-        $acf = get_fields( $item->taxonomy . '_' . $term_id );
-        if ( ! is_array( $acf ) ) {
-            $acf = [];
-        }
-
-        // For boolean (true/false) ACF fields, ACF can sometimes return stale cached values.
-        // We read these directly from get_term_meta() to guarantee the live database value.
-        $raw_meta = get_term_meta( $term_id );
-        foreach ( $raw_meta as $meta_key => $meta_values ) {
-            // Skip internal WordPress/ACF reference keys (they start with _ or contain /)
-            if ( substr( $meta_key, 0, 1 ) === '_' ) {
-                continue;
-            }
-            $raw_val = isset( $meta_values[0] ) ? $meta_values[0] : null;
-            // Only override if the key exists in the ACF array (don't add extra unknown keys)
-            if ( array_key_exists( $meta_key, $acf ) ) {
-                // ACF stores booleans as "1" (true) or "" (false) in term meta
-                if ( $raw_val === '1' || $raw_val === 1 ) {
-                    $acf[ $meta_key ] = true;
-                } elseif ( $raw_val === '' || $raw_val === '0' || $raw_val === 0 || $raw_val === false ) {
-                    $acf[ $meta_key ] = false;
-                }
-            }
-        }
-
-        // Merge in defaults for fields that may not have been saved to the DB yet
-        $acf_defaults = [
-            'brands'       => true,
-            'in_stock'     => true,
-            'price_slider' => true,
-        ];
-        foreach ( $acf_defaults as $key => $default ) {
-            if ( ! array_key_exists( $key, $acf ) ) {
-                $acf[ $key ] = $default;
-            }
-        }
-
-        $response->data['acf'] = $acf;
+        $response->data['acf'] = get_fields( $item->taxonomy . '_' . $item->term_id );
     } else {
         $response->data['acf'] = null;
     }
